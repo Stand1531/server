@@ -112,6 +112,11 @@ SUPPORTED_FEATURES = {
     ProviderFeature.RECOMMENDATIONS,
 }
 
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
+
+urllib3.disable_warnings(InsecureRequestWarning)
+
 def resolve_plex_server(
     local_server_ip: str,
     local_server_port: int,
@@ -137,10 +142,6 @@ def resolve_plex_server(
 
     # silence loggers
     logging.getLogger("plexapi").setLevel(logging.WARNING)
-    # silence urllib3 InsecureRequestWarning when certificate verification is disabled
-    # this is expected when connecting to Plex servers using their wildcard certificates
-    # that don't validate against LAN IP addresses
-    logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
     local_server_protocol = "https" if local_server_ssl else "http"
     base_url = f"{local_server_protocol}://{local_server_ip}:{local_server_port}"
