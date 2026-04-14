@@ -206,7 +206,7 @@ class AuthenticationManager:
             )
             """
         )
-        # Join codes table (for short code to JWT exchange, used by providers like party mode)
+        # Join codes table (for short code to JWT exchange, used by providers like party)
         await self.database.execute(
             """
             CREATE TABLE IF NOT EXISTS join_codes (
@@ -1476,7 +1476,7 @@ class AuthenticationManager:
         :param player_filter: List of player IDs user has access to (set by admin only, optional).
         :param provider_filter: List of provider instance IDs user has access to (set by admin only, optional).
         :return: Updated user object.
-        """  # noqa: E501
+        """
         current_user_obj = get_current_user()
         if not current_user_obj:
             raise AuthenticationRequired("Not authenticated")
@@ -1616,7 +1616,7 @@ class AuthenticationManager:
         """Generate a short join code for link/QR-based login.
 
         This creates a short alphanumeric code that can be exchanged for a JWT token.
-        Used for features like party mode guest access, device pairing,
+        Used for features like the party provider guest access, device pairing,
         or other short-code authentication flows.
 
         :param user: The guest user that tokens created from this code will belong to.

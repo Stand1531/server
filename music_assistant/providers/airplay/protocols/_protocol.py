@@ -59,7 +59,8 @@ class AirPlayProtocol(ABC):
         self._stream_bytes_sent = 0
         self._connected = asyncio.Event()
         self._metadata_checksum = ""
-        self._last_metadata_sent: float = 0.0
+        self._last_progress_sent: int = -1
+        self._elapsed_time_offset: float | None = None
 
     @property
     def running(self) -> bool:
@@ -81,9 +82,12 @@ class AirPlayProtocol(ABC):
         # repeat sending the volume level to the player because some players seem
         # to ignore it the first time
         # https://github.com/music-assistant/support/issues/3330
-        self.mass.call_later(2, self.send_cli_command(f"VOLUME={self.player.volume_level}"))
+        volume = 0 if self.player.volume_muted else self.player.volume_level
+        self.mass.call_later(2, self.send_cli_command(f"VOLUME={volume}"))
         # we also need to send the metadata after connection, because some players (e.g. Sonos)
         # simply won't start playback until they receive the metadata ?!
+        # reset checksum so the resend isn't blocked by deduplication
+        self._metadata_checksum = ""
         self.mass.call_later(2, self.player._on_player_media_updated)
 
     async def stop(self, force: bool = False) -> None:
@@ -106,7 +110,7 @@ class AirPlayProtocol(ABC):
                 await self._cli_proc.write_eof()
             if self._cli_proc and not self._cli_proc.closed:
                 await self._cli_proc.close()
-            self.player.set_state_from_stream(state=PlaybackState.IDLE, elapsed_time=0)
+        self.player.set_state_from_stream(state=PlaybackState.IDLE, elapsed_time=0)
 
     async def write_audio(self, data: bytes) -> None:
         """Write raw audio data to the CLI process stdin.
@@ -145,21 +149,17 @@ class AirPlayProtocol(ABC):
             album = metadata.album or ""
 
             metadata_checksum = f"{title}|{artist}|{album}|{duration}|{metadata.image_url}"
-            if (
-                metadata_checksum == self._metadata_checksum
-                and time.time() - self._last_metadata_sent <= 2
-            ):
-                # metadata has not changed since last time, skip sending to CLI
+            if metadata_checksum == self._metadata_checksum:
                 return
             self._metadata_checksum = metadata_checksum
-            self._last_metadata_sent = time.time()
 
             cmd = f"TITLE={title}\nARTIST={artist}\nALBUM={album}\n"
             cmd += f"DURATION={duration}\nPROGRESS=0\nACTION=SENDMETA\n"
 
             await self.send_cli_command(cmd)
-            # get image
+            self._last_progress_sent = 0
             if metadata.image_url:
                 await self.send_cli_command(f"ARTWORK={metadata.image_url}")
-        if progress is not None:
+        if progress is not None and abs(progress - self._last_progress_sent) >= 2:
+            self._last_progress_sent = progress
             await self.send_cli_command(f"PROGRESS={progress}")

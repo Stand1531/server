@@ -25,6 +25,7 @@ CONF_ENCRYPTION: Final[str] = "encryption"
 CONF_ALAC_ENCODE: Final[str] = "alac_encode"
 CONF_VOLUME_START: Final[str] = "volume_start"
 CONF_PASSWORD: Final[str] = "password"
+CONF_AP2PASSWORD: Final[str] = "ap2password"
 CONF_IGNORE_VOLUME: Final[str] = "ignore_volume"
 CONF_CREDENTIALS: Final[str] = "credentials"
 CONF_AIRPLAY_PROTOCOL: Final[str] = "airplay_protocol"
@@ -57,13 +58,12 @@ CONF_ACTION_START_PAIRING: Final[str] = "start_pairing"
 CONF_ACTION_FINISH_PAIRING: Final[str] = "finish_pairing"
 CONF_ACTION_RESET_PAIRING: Final[str] = "reset_pairing"
 CONF_PAIRING_PIN: Final[str] = "pairing_pin"
-CONF_ENABLE_LATE_JOIN: Final[str] = "enable_late_join"
-
+CONF_PAIRING_PASSWORD: Final[str] = "pairing_password"
 BACKOFF_TIME_LOWER_LIMIT: Final[int] = 15  # seconds
 BACKOFF_TIME_UPPER_LIMIT: Final[int] = 300  # Five minutes
-ENABLE_LATE_JOIN_DEFAULT: Final[bool] = True
 
 FALLBACK_VOLUME: Final[int] = 20
+AIRPLAY_VOLUME_MUTE: Final[float] = -144.0
 
 AIRPLAY_FLOW_PCM_FORMAT = AudioFormat(
     content_type=INTERNAL_PCM_FORMAT.content_type,
@@ -86,8 +86,6 @@ AIRPLAY_2_DEFAULT_MODELS = (
     ("LG Electronics", "*"),
 )
 
-PIN_REQUIRED = 0x8
-LEGACY_PAIRING_BIT = 0x200
 BROKEN_AIRPLAY_WARN = ConfigEntry(
     key="BROKEN_AIRPLAY",
     type=ConfigEntryType.ALERT,
@@ -105,4 +103,10 @@ BASE_PLAYER_FEATURES: Final[set[PlayerFeature]] = {
     PlayerFeature.SET_MEMBERS,
     PlayerFeature.MULTI_DEVICE_DSP,
     PlayerFeature.VOLUME_SET,
+    PlayerFeature.VOLUME_MUTE,
 }
+
+
+PIN_REQUIRED = 0x8
+PASSWORD_BIT = 0x80
+LEGACY_PAIRING_BIT = 0x200

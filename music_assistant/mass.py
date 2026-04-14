@@ -16,26 +16,17 @@ import aiofiles
 from aiofiles.os import wrap
 from music_assistant_models.api import ServerInfoMessage
 from music_assistant_models.auth import UserRole
-from music_assistant_models.enums import CoreState, EventType, ProviderType
+from music_assistant_models.enums import CoreState, EventType, ProviderFeature, ProviderType
 from music_assistant_models.errors import MusicAssistantError, SetupFailedError
 from music_assistant_models.event import MassEvent
 from music_assistant_models.helpers import set_global_cache_values
 from music_assistant_models.provider import ProviderManifest
-from zeroconf import (
-    InterfaceChoice,
-    IPVersion,
-    NonUniqueNameException,
-    ServiceStateChange,
-    Zeroconf,
-)
-from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
 
 from music_assistant.constants import (
     API_SCHEMA_VERSION,
     CONF_DEFAULT_PROVIDERS_SETUP,
     CONF_PROVIDERS,
     CONF_SERVER_ID,
-    CONF_ZEROCONF_INTERFACES,
     CONFIGURABLE_CORE_CONTROLLERS,
     DEFAULT_PROVIDERS,
     MASS_LOGGER_NAME,
@@ -44,11 +35,13 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.cache import CacheController
 from music_assistant.controllers.config import ConfigController
+from music_assistant.controllers.discovery import DiscoveryController
 from music_assistant.controllers.metadata import MetaDataController
 from music_assistant.controllers.music import MusicController
 from music_assistant.controllers.player_queues import PlayerQueuesController
 from music_assistant.controllers.players import PlayerController
 from music_assistant.controllers.streams import StreamsController
+from music_assistant.controllers.tasks import TasksController
 from music_assistant.controllers.webserver import WebserverController
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.aiohttp_client import create_clientsession
@@ -56,15 +49,16 @@ from music_assistant.helpers.api import APICommandHandler, api_command
 from music_assistant.helpers.images import get_icon_string
 from music_assistant.helpers.util import (
     TaskManager,
-    get_ip_pton,
     get_package_version,
     is_hass_supervisor,
     load_provider_module,
     warn_if_missing_x86_64_v2,
 )
 from music_assistant.models import ProviderInstanceType
+from music_assistant.models.audio_analysis_provider import AudioAnalysisProvider
 from music_assistant.models.music_provider import MusicProvider
 from music_assistant.models.player_provider import PlayerProvider
+from music_assistant.models.plugin import PluginProvider
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -105,20 +99,27 @@ def is_player_provider(provider: ProviderInstanceType) -> TypeGuard[PlayerProvid
     return provider.type == ProviderType.PLAYER
 
 
+def is_audio_analysis_provider(
+    provider: ProviderInstanceType,
+) -> TypeGuard[AudioAnalysisProvider]:
+    """Type guard that returns true if a provider is an audio analysis provider."""
+    return provider.type == ProviderType.AUDIO_ANALYSIS
+
+
 class MusicAssistant:
     """Main MusicAssistant (Server) object."""
 
     loop: asyncio.AbstractEventLoop
-    aiozc: AsyncZeroconf
     config: ConfigController
     webserver: WebserverController
     cache: CacheController
     metadata: MetaDataController
+    tasks: TasksController
     music: MusicController
     players: PlayerController
     player_queues: PlayerQueuesController
+    discovery: DiscoveryController
     streams: StreamsController
-    _aiobrowser: AsyncServiceBrowser
 
     def __init__(self, storage_path: str, cache_path: str, safe_mode: bool = False) -> None:
         """Initialize the MusicAssistant Server."""
@@ -133,6 +134,7 @@ class MusicAssistant:
         self._providers: dict[str, ProviderInstanceType] = {}
         self._tracked_tasks: dict[str, asyncio.Task[Any]] = {}
         self._tracked_timers: dict[str, asyncio.TimerHandle] = {}
+        self._provider_ready_events: dict[str, asyncio.Event] = {}
         self.running_as_hass_addon: bool = False
         self.version: str = "0.0.0"
         self.logger = LOGGER
@@ -142,7 +144,6 @@ class MusicAssistant:
         )
         self._http_session: ClientSession | None = None
         self._http_session_no_ssl: ClientSession | None = None
-        self._mdns_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         """Start running the Music Assistant server."""
@@ -153,16 +154,7 @@ class MusicAssistant:
         # setup config controller first and fetch important config values
         self.config = ConfigController(self)
         await self.config.setup()
-        # create shared zeroconf instance
-        zeroconf_interfaces = self.config.get_raw_core_config_value(
-            "players", CONF_ZEROCONF_INTERFACES, "default"
-        )
-        # IPv6 requires InterfaceChoice.All, so only enable when zeroconf_interfaces is "all"
-        use_all_interfaces = zeroconf_interfaces == "all"
-        self.aiozc = AsyncZeroconf(
-            ip_version=IPVersion.All if use_all_interfaces else IPVersion.V4Only,
-            interfaces=InterfaceChoice.All if use_all_interfaces else InterfaceChoice.Default,
-        )
+        self.discovery = DiscoveryController(self)
         # load all available providers from manifest files
         await self.__load_provider_manifests()
         # setup/migrate storage
@@ -177,6 +169,7 @@ class MusicAssistant:
         await warn_if_missing_x86_64_v2(LOGGER)
         # setup other core controllers
         self.cache = CacheController(self)
+        self.tasks = TasksController(self)
         self.webserver = WebserverController(self)
         self.metadata = MetaDataController(self)
         self.music = MusicController(self)
@@ -195,19 +188,30 @@ class MusicAssistant:
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(setup_controller(self.cache))
+            tg.create_task(setup_controller(self.tasks))
             tg.create_task(setup_controller(self.streams))
             tg.create_task(setup_controller(self.music))
             tg.create_task(setup_controller(self.metadata))
             tg.create_task(setup_controller(self.players))
             tg.create_task(setup_controller(self.player_queues))
 
+        for controller_name in (
+            "cache",
+            "tasks",
+            "streams",
+            "music",
+            "metadata",
+            "players",
+            "player_queues",
+        ):
+            await cast("CoreController", getattr(self, controller_name)).post_setup()
+
         # load webserver/api now that the core controllers are setup and ready to be used
         self._register_api_commands()
         await self.webserver.setup(await self.config.get_core_config("webserver"))
+        await setup_controller(self.discovery)
         # load builtin providers (always needed, also in safe mode)
         await self._load_builtin_providers()
-        # setup discovery
-        await self._setup_discovery()
         # load regular providers (skip when in safe mode)
         # providers are loaded in background tasks so they won't block
         # the startup if they fail or take a long time to load
@@ -231,8 +235,10 @@ class MusicAssistant:
             return_exceptions=True,
         )
         # stop core controllers
+        await self.discovery.close()
         await self.streams.close()
         await self.webserver.close()
+        await self.tasks.close()
         await self.metadata.close()
         await self.music.close()
         await self.player_queues.close()
@@ -240,15 +246,11 @@ class MusicAssistant:
         # cleanup cache and config
         await self.config.close()
         await self.cache.close()
-        # close/cleanup shared http session
-        if self._http_session:
-            self._http_session.detach()
-            if self._http_session.connector:
-                await self._http_session.connector.close()
-        if self._http_session_no_ssl:
-            self._http_session_no_ssl.detach()
-            if self._http_session_no_ssl.connector:
-                await self._http_session_no_ssl.connector.close()
+        # close/cleanup shared http sessions
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+        if self._http_session_no_ssl and not self._http_session_no_ssl.closed:
+            await self._http_session_no_ssl.close()
         self._set_state(CoreState.STOPPED)
 
     @property
@@ -405,6 +407,12 @@ class MusicAssistant:
                 return prov
         return None
 
+    def get_provider_ready_event(self, domain: str) -> asyncio.Event:
+        """Get (or create) an asyncio.Event that is set when a provider of the given domain is loaded."""
+        if domain not in self._provider_ready_events:
+            self._provider_ready_events[domain] = asyncio.Event()
+        return self._provider_ready_events[domain]
+
     def get_provider_instances(
         self,
         domain: str,
@@ -423,6 +431,19 @@ class MusicAssistant:
             and prov.domain == domain
             and (return_unavailable or prov.available)
         ]
+
+    def get_plugins_by_feature(self, feature: ProviderFeature) -> list[PluginProvider]:
+        """Return all available PluginProvider instances that support the given feature."""
+        return cast(
+            "list[PluginProvider]",
+            [
+                prov
+                for prov in list(self._providers.values())
+                if prov.available
+                and isinstance(prov, PluginProvider)
+                and feature in prov.supported_features
+            ],
+        )
 
     def signal_event(
         self,
@@ -721,12 +742,8 @@ class MusicAssistant:
 
     async def unload_provider(self, instance_id: str, is_removed: bool = False) -> None:
         """Unload a provider."""
-        self.music.unschedule_provider_sync(instance_id)
+        self.music.unschedule_provider_sync(instance_id, clear_persisted_state=is_removed)
         if provider := self._providers.get(instance_id):
-            # remove mdns discovery if needed
-            if provider.manifest.mdns_discovery:
-                for mdns_type in provider.manifest.mdns_discovery:
-                    self._aiobrowser.types.discard(mdns_type)
             if isinstance(provider, PlayerProvider):
                 await self.players.on_provider_unload(provider)
             if isinstance(provider, MusicProvider):
@@ -746,7 +763,10 @@ class MusicAssistant:
                     "Error while unloading provider %s: %s", provider.name, str(err), exc_info=err
                 )
             finally:
+                if provider.domain in self._provider_ready_events:
+                    self._provider_ready_events[provider.domain].clear()
                 self._providers.pop(instance_id, None)
+                self.discovery.on_provider_unload(instance_id)
                 await self._update_available_providers_cache()
                 self.signal_event(EventType.PROVIDERS_UPDATED, data=self.get_providers())
 
@@ -757,26 +777,14 @@ class MusicAssistant:
 
     async def run_provider_discovery(self, instance_id: str) -> None:
         """
-        Run mDNS discovery for a given provider.
+        Run shared discovery for a given provider.
 
         In case of a PlayerProvider, will also call its own discovery method.
         """
         provider = self.get_provider(instance_id, return_unavailable=False)
         if not provider:
             raise KeyError(f"Provider with instance ID {instance_id} not found")
-        if provider.manifest.mdns_discovery:
-            if provider.instance_id not in self._mdns_locks:
-                self._mdns_locks[provider.instance_id] = asyncio.Lock()
-            async with self._mdns_locks[provider.instance_id]:
-                for mdns_type in provider.manifest.mdns_discovery or []:
-                    for mdns_name in set(self.aiozc.zeroconf.cache.cache):
-                        if mdns_type not in mdns_name or mdns_type == mdns_name:
-                            continue
-                        info = AsyncServiceInfo(mdns_type, mdns_name)
-                        if await info.async_request(self.aiozc.zeroconf, 3000):
-                            await provider.on_mdns_service_state_change(
-                                mdns_name, ServiceStateChange.Added, info
-                            )
+        await self.discovery.run_provider_discovery(provider)
         if isinstance(provider, PlayerProvider):
             await provider.discover_players()
 
@@ -793,6 +801,7 @@ class MusicAssistant:
             self,
             self.config,
             self.metadata,
+            self.tasks,
             self.music,
             self.players,
             self.player_queues,
@@ -802,10 +811,14 @@ class MusicAssistant:
             for attr_name in dir(cls):
                 if attr_name.startswith("__"):
                     continue
+                # Skip properties to avoid triggering lazy initialization side effects
+                # (e.g. http_session creating an aiohttp connector during registration)
+                if isinstance(getattr(type(cls), attr_name, None), property):
+                    continue
                 try:
                     obj = getattr(cls, attr_name)
                 except (AttributeError, RuntimeError):
-                    # Skip properties that fail during initialization
+                    # Skip attributes that fail during initialization
                     continue
                 if hasattr(obj, "api_cmd"):
                     # method is decorated with our api decorator
@@ -855,16 +868,18 @@ class MusicAssistant:
         self.config.set_default(CONF_DEFAULT_PROVIDERS_SETUP, set())
         default_providers_setup = set(self.config.get(CONF_DEFAULT_PROVIDERS_SETUP))
         changes_made = False
-        for default_provider, require_mdns in DEFAULT_PROVIDERS:
+        for default_provider, require_mdns, precondition in DEFAULT_PROVIDERS:
             if default_provider in default_providers_setup:
                 # already processed/setup before, skip
                 continue
             if not (manifest := self._provider_manifests.get(default_provider)):
                 continue
+            if not precondition():
+                continue
             if require_mdns:
                 # if mdns discovery is required, check if we have seen any mdns entries
                 # for this provider before setting it up
-                for mdns_name in set(self.aiozc.zeroconf.cache.cache):
+                for mdns_name in set(self.discovery.aiozc.zeroconf.cache.cache):
                     if manifest.mdns_discovery and any(
                         mdns_type in mdns_name for mdns_type in manifest.mdns_discovery
                     ):
@@ -965,6 +980,8 @@ class MusicAssistant:
         # execute post load actions
         async def _on_provider_loaded() -> None:
             await provider.loaded_in_mass()
+            provider.initialized.set()
+            self.get_provider_ready_event(provider.domain).set()
             await self.run_provider_discovery(provider.instance_id)
             # push instance name to config (to persist it if it was autogenerated)
             if provider.default_name != conf.default_name:
@@ -1039,79 +1056,6 @@ class MusicAssistant:
                     continue
                 tg.create_task(load_provider_manifest(dir_str, dir_path))
         self.logger.debug("Loaded %s provider manifests", len(self._provider_manifests))
-
-    async def _setup_discovery(self) -> None:
-        """Handle setup of MDNS discovery."""
-        # create a global mdns browser
-        all_types: set[str] = set()
-        for prov_manifest in self._provider_manifests.values():
-            if prov_manifest.mdns_discovery:
-                all_types.update(prov_manifest.mdns_discovery)
-        self._aiobrowser = AsyncServiceBrowser(
-            self.aiozc.zeroconf,
-            list(all_types),
-            handlers=[self._on_mdns_service_state_change],
-        )
-        # register MA itself on mdns to be discovered
-        zeroconf_type = "_mass._tcp.local."
-        server_id = self.server_id
-        LOGGER.debug("Starting Zeroconf broadcast...")
-        info = AsyncServiceInfo(
-            zeroconf_type,
-            name=f"{server_id}.{zeroconf_type}",
-            addresses=[await get_ip_pton(self.webserver.publish_ip)],
-            port=self.webserver.publish_port,
-            properties=self.get_server_info().to_dict(),
-            server="mass.local.",
-        )
-        try:
-            existing = getattr(self, "mass_zc_service_set", None)
-            if existing:
-                await self.aiozc.async_update_service(info)
-            else:
-                await self.aiozc.async_register_service(info)
-            self.mass_zc_service_set = True
-        except NonUniqueNameException:
-            LOGGER.error(
-                "Music Assistant instance with identical name present in the local network!"
-            )
-
-    def _on_mdns_service_state_change(
-        self,
-        zeroconf: Zeroconf,
-        service_type: str,
-        name: str,
-        state_change: ServiceStateChange,
-    ) -> None:
-        """Handle MDNS service state callback."""
-
-        async def process_mdns_state_change(prov: ProviderInstanceType) -> None:
-            if prov.instance_id not in self._mdns_locks:
-                self._mdns_locks[prov.instance_id] = asyncio.Lock()
-            if state_change == ServiceStateChange.Removed:
-                info = None
-            else:
-                info = AsyncServiceInfo(service_type, name)
-                await info.async_request(zeroconf, 3000)
-            # use a lock per provider instance to avoid
-            # race conditions in processing mdns events
-            async with self._mdns_locks[prov.instance_id]:
-                await prov.on_mdns_service_state_change(name, state_change, info)
-
-        LOGGER.log(
-            VERBOSE_LOG_LEVEL,
-            "Service %s of type %s state changed: %s",
-            name,
-            service_type,
-            state_change,
-        )
-        for prov in list(self._providers.values()):
-            if not prov.manifest.mdns_discovery:
-                continue
-            if not prov.available:
-                continue
-            if service_type in prov.manifest.mdns_discovery:
-                self.create_task(process_mdns_state_change(prov))
 
     async def __aenter__(self) -> Self:
         """Return Context manager."""

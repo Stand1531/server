@@ -53,6 +53,7 @@ from music_assistant.constants import (
     CONF_ENTRY_ANNOUNCE_VOLUME_MIN,
     CONF_ENTRY_ANNOUNCE_VOLUME_STRATEGY,
     CONF_ENTRY_AUTO_PLAY,
+    CONF_ENTRY_CROSSFADE_DIFFERENT_SAMPLE_RATES,
     CONF_ENTRY_CROSSFADE_DURATION,
     CONF_ENTRY_ENABLE_ICY_METADATA,
     CONF_ENTRY_FLOW_MODE,
@@ -73,18 +74,11 @@ from music_assistant.constants import (
     CONF_ENTRY_OUTPUT_LIMITER,
     CONF_ENTRY_PLAYER_ICON,
     CONF_ENTRY_PLAYER_ICON_GROUP,
-    CONF_ENTRY_PROVIDER_SYNC_INTERVAL_ALBUMS,
-    CONF_ENTRY_PROVIDER_SYNC_INTERVAL_ARTISTS,
-    CONF_ENTRY_PROVIDER_SYNC_INTERVAL_AUDIOBOOKS,
-    CONF_ENTRY_PROVIDER_SYNC_INTERVAL_PLAYLISTS,
-    CONF_ENTRY_PROVIDER_SYNC_INTERVAL_PODCASTS,
-    CONF_ENTRY_PROVIDER_SYNC_INTERVAL_RADIOS,
-    CONF_ENTRY_PROVIDER_SYNC_INTERVAL_TRACKS,
     CONF_ENTRY_SAMPLE_RATES,
-    CONF_ENTRY_SMART_FADES_MODE,
     CONF_ENTRY_TTS_PRE_ANNOUNCE,
     CONF_ENTRY_VOLUME_NORMALIZATION,
     CONF_ENTRY_VOLUME_NORMALIZATION_TARGET,
+    CONF_ENTRY_ZEROCONF_INTERFACES,
     CONF_EXPOSE_PLAYER_TO_HA,
     CONF_HIDE_IN_UI,
     CONF_MUTE_CONTROL,
@@ -99,12 +93,19 @@ from music_assistant.constants import (
     CONF_PROTOCOL_KEY_SPLITTER,
     CONF_PROVIDERS,
     CONF_SERVER_ID,
+    CONF_SMART_FADES_MODE,
     CONF_VOLUME_CONTROL,
     CONFIGURABLE_CORE_CONTROLLERS,
     DEFAULT_CORE_CONFIG_ENTRIES,
     DEFAULT_PROVIDER_CONFIG_ENTRIES,
     ENCRYPT_SUFFIX,
     NON_HTTP_PROVIDERS,
+    PLAYER_CONTROL_PROTOCOL,
+)
+from music_assistant.controllers.streams.constants import (
+    CONF_BUFFER_SIZE,
+    CONF_BUFFER_SIZE_DEFAULT,
+    BufferSize,
 )
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.json import JSON_DECODE_EXCEPTIONS, async_json_dumps, async_json_loads
@@ -361,7 +362,7 @@ class ConfigController:
         )
 
     @api_command("config/providers/get_entries")
-    async def get_provider_config_entries(  # noqa: PLR0915
+    async def get_provider_config_entries(
         self,
         provider_domain: str,
         instance_id: str | None = None,
@@ -427,21 +428,6 @@ class ConfigController:
                 extra_entries.append(CONF_ENTRY_LIBRARY_SYNC_PODCASTS)
             if ProviderFeature.LIBRARY_RADIOS in supported_features:
                 extra_entries.append(CONF_ENTRY_LIBRARY_SYNC_RADIOS)
-            # sync interval settings
-            if ProviderFeature.LIBRARY_ARTISTS in supported_features:
-                extra_entries.append(CONF_ENTRY_PROVIDER_SYNC_INTERVAL_ARTISTS)
-            if ProviderFeature.LIBRARY_ALBUMS in supported_features:
-                extra_entries.append(CONF_ENTRY_PROVIDER_SYNC_INTERVAL_ALBUMS)
-            if ProviderFeature.LIBRARY_TRACKS in supported_features:
-                extra_entries.append(CONF_ENTRY_PROVIDER_SYNC_INTERVAL_TRACKS)
-            if ProviderFeature.LIBRARY_PLAYLISTS in supported_features:
-                extra_entries.append(CONF_ENTRY_PROVIDER_SYNC_INTERVAL_PLAYLISTS)
-            if ProviderFeature.LIBRARY_AUDIOBOOKS in supported_features:
-                extra_entries.append(CONF_ENTRY_PROVIDER_SYNC_INTERVAL_AUDIOBOOKS)
-            if ProviderFeature.LIBRARY_PODCASTS in supported_features:
-                extra_entries.append(CONF_ENTRY_PROVIDER_SYNC_INTERVAL_PODCASTS)
-            if ProviderFeature.LIBRARY_RADIOS in supported_features:
-                extra_entries.append(CONF_ENTRY_PROVIDER_SYNC_INTERVAL_RADIOS)
             # sync export settings
             if supported_features.intersection(
                 {
@@ -1054,7 +1040,11 @@ class ConfigController:
     @api_command("config/core/get")
     async def get_core_config(self, domain: str) -> CoreConfig:
         """Return configuration for a single core controller."""
-        raw_conf = self.get(f"{CONF_CORE}/{domain}", {"domain": domain})
+        raw_conf = self.get(f"{CONF_CORE}/{domain}", {})
+        if not isinstance(raw_conf, dict):
+            raw_conf = {}
+        if "domain" not in raw_conf:
+            raw_conf = {**raw_conf, "domain": domain}
         config_entries = await self.get_core_config_entries(domain)
         return cast("CoreConfig", CoreConfig.parse(config_entries, raw_conf))
 
@@ -1366,6 +1356,27 @@ class ConfigController:
                 LOGGER.warning("Removed corrupt provider configuration: %s", instance_id)
                 changed = True
 
+        # Remove corrupt player configurations that are missing the required 'player_id' key
+        # This can happen when _clear_protocol_parent_id is called on an already-deleted player
+        # TODO: remove after 2.8 release
+        for player_id, player_config in list(self._data.get(CONF_PLAYERS, {}).items()):
+            if "player_id" not in player_config:
+                self._data[CONF_PLAYERS].pop(player_id, None)
+                # Also remove any DSP config for this player
+                if CONF_PLAYER_DSP in self._data:
+                    self._data[CONF_PLAYER_DSP].pop(player_id, None)
+                changed = True
+
+        # The background tasks controller originally persisted runtime state directly under
+        # core/tasks, which could create a CoreConfig object without the required domain field.
+        # Repair that single known corruption case on load.
+        # TODO: remove after 2.9 release
+        tasks_core_config = self._data.get(CONF_CORE, {}).get("tasks")
+        if isinstance(tasks_core_config, dict) and "domain" not in tasks_core_config:
+            tasks_core_config["domain"] = "tasks"
+            LOGGER.warning("Repaired corrupt tasks core configuration")
+            changed = True
+
         # migrate manual_ips to new format
         # TODO: remove after 2.8 release
         for instance_id, provider_config in self._data.get(CONF_PROVIDERS, {}).items():
@@ -1375,6 +1386,26 @@ class ConfigController:
                 continue
             values["manual_discovery_ip_addresses"] = ips.split(",")
             del values["ips"]
+            changed = True
+
+        # migrate zeroconf interface selection from players controller to discovery controller
+        # TODO: remove after 2.8 release
+        core_configs = self._data.setdefault(CONF_CORE, {})
+        players_core = core_configs.get("players", {})
+        discovery_core = core_configs.setdefault("discovery", {"domain": "discovery", "values": {}})
+        discovery_values = discovery_core.setdefault("values", {})
+        players_values = players_core.get("values", {})
+        legacy_zeroconf_interfaces = players_values.pop(CONF_ENTRY_ZEROCONF_INTERFACES.key, None)
+        if legacy_zeroconf_interfaces is None and players_core:
+            legacy_zeroconf_interfaces = players_core.pop(CONF_ENTRY_ZEROCONF_INTERFACES.key, None)
+        if (
+            legacy_zeroconf_interfaces is not None
+            and CONF_ENTRY_ZEROCONF_INTERFACES.key not in discovery_values
+            and CONF_ENTRY_ZEROCONF_INTERFACES.key not in discovery_core
+        ):
+            discovery_values[CONF_ENTRY_ZEROCONF_INTERFACES.key] = legacy_zeroconf_interfaces
+            changed = True
+        elif legacy_zeroconf_interfaces is not None:
             changed = True
 
         # migrate sample_rates config entry
@@ -1473,6 +1504,23 @@ class ConfigController:
                 values.pop("protocol_parent_id")
                 changed = True
 
+        # Remove orphaned stored_radios config from RadioBrowser provider instances
+        # now that LIBRARY_RADIOS support has been removed from the provider.
+        # TODO: remove after 2.8 release
+        for instance_id, provider_config in self._data.get(CONF_PROVIDERS, {}).items():
+            if provider_config.get("domain") != "radiobrowser":
+                continue
+            if not (values := provider_config.get("values")):
+                continue
+            for key in (
+                "stored_radios",
+                "library_sync_radios",
+                "provider_sync_interval_radios",
+                "library_sync_back",
+            ):
+                if values.pop(key, None) is not None:
+                    changed = True
+
         if changed:
             await self._async_save()
 
@@ -1527,6 +1575,9 @@ class ConfigController:
                 self.set_provider_default_name(
                     prov_instance.instance_id, prov_instance.default_name
                 )
+            if "name" in changed_keys:
+                # signal providers updated so frontends refresh the provider name
+                self.mass.signal_event(EventType.PROVIDERS_UPDATED, data=self.mass.get_providers())
         elif config.enabled:
             # provider is enabled but not available, try to load it
             await self.mass.load_provider_config(config)
@@ -1616,7 +1667,7 @@ class ConfigController:
             await self.set_onboard_complete()
         if manifest.type == ProviderType.MUSIC:
             # correct any multi-instance provider mappings
-            self.mass.create_task(self.mass.music.correct_multi_instance_provider_mappings())
+            self.mass.music.queue_provider_mapping_correction_task()
         return config
 
     async def _get_player_config_entries(
@@ -1664,6 +1715,8 @@ class ConfigController:
                 # add flow mode entry for http-based players that do not already enforce it
                 if not player.requires_flow_mode:
                     default_entries.append(CONF_ENTRY_FLOW_MODE)
+        if PlayerFeature.GAPLESS_PLAYBACK in player.supported_features:
+            default_entries.append(CONF_ENTRY_CROSSFADE_DIFFERENT_SAMPLE_RATES)
         # request player specific entries
         player_entries = await player.get_config_entries(action=action, values=values)
         players_keys = {entry.key for entry in player_entries}
@@ -1686,8 +1739,33 @@ class ConfigController:
 
         # some base entries for all player types
         # note that these may NOT be playback/audio related
+        buffer_size = self.get_raw_core_config_value(
+            "streams", CONF_BUFFER_SIZE, CONF_BUFFER_SIZE_DEFAULT
+        )
+        # smart crossfade needs a larger buffer for beat analysis
+        smart_fades_options = [
+            ConfigValueOption("Disabled", "disabled"),
+            ConfigValueOption("Standard Crossfade", "standard_crossfade"),
+        ]
+        if buffer_size != BufferSize.MINIMAL:
+            smart_fades_options.insert(1, ConfigValueOption("Smart Crossfade", "smart_crossfade"))
+
         entries += [
-            CONF_ENTRY_SMART_FADES_MODE,
+            ConfigEntry(
+                key=CONF_SMART_FADES_MODE,
+                type=ConfigEntryType.STRING,
+                label="Enable Smart Fades",
+                options=smart_fades_options,
+                default_value="disabled",
+                description="Select the crossfade mode to use when transitioning "
+                "between tracks.\n\n"
+                "- 'Smart Crossfade': Uses beat matching and EQ filters to create "
+                "smooth transitions between tracks.\n"
+                "- 'Standard Crossfade': Regular crossfade that crossfades the "
+                "last/first x-seconds of a track.",
+                category="playback",
+                requires_reload=True,
+            ),
             CONF_ENTRY_CROSSFADE_DURATION,
             # we allow volume normalization/output limiter here as it is a per-queue(player) setting
             CONF_ENTRY_VOLUME_NORMALIZATION,
@@ -1755,49 +1833,70 @@ class ConfigController:
         power_controls = [x for x in all_controls if x.supports_power]
         volume_controls = [x for x in all_controls if x.supports_volume]
         mute_controls = [x for x in all_controls if x.supports_mute]
+        auto_option = ConfigValueOption(
+            title="Auto-select (based on active/preferred protocol)", value=PLAYER_CONTROL_PROTOCOL
+        )
         # work out player supported features
-        base_power_options: list[ConfigValueOption] = []
+        power_options: list[ConfigValueOption] = []
         if player.supports_feature(PlayerFeature.POWER):
-            base_power_options.append(
+            power_options.append(
                 ConfigValueOption(title="Native power control", value=PLAYER_CONTROL_NATIVE),
             )
-        base_volume_options: list[ConfigValueOption] = []
+        volume_options: list[ConfigValueOption] = []
+        has_native_volume_control = False
         if player.supports_feature(PlayerFeature.VOLUME_SET):
-            base_volume_options.append(
+            has_native_volume_control = True
+            volume_options.append(
                 ConfigValueOption(title="Native volume control", value=PLAYER_CONTROL_NATIVE),
             )
-        base_mute_options: list[ConfigValueOption] = []
+        mute_options: list[ConfigValueOption] = []
         if player.supports_feature(PlayerFeature.VOLUME_MUTE):
-            base_mute_options.append(
+            mute_options.append(
                 ConfigValueOption(title="Native mute control", value=PLAYER_CONTROL_NATIVE),
             )
-        # append protocol-specific volume and mute controls to the base options
+        # add player protocols as volume controls if native player has no volume control
         for linked_protocol in player.linked_output_protocols:
-            if protocol_player := self.mass.players.get_player(linked_protocol.output_protocol_id):
-                if protocol_player.supports_feature(PlayerFeature.VOLUME_SET):
-                    base_volume_options.append(
+            if has_native_volume_control:
+                break
+            protocol_player = self.mass.players.get_player(linked_protocol.output_protocol_id)
+            if not protocol_player or not protocol_player.available:
+                continue
+            if protocol_player.supports_feature(PlayerFeature.VOLUME_SET):
+                if auto_option not in volume_options:
+                    volume_options.append(auto_option)
+                if linked_protocol.protocol_domain in ("chromecast", "dlna"):
+                    # for chromecast/dlna we can use the protocol player for volume control
+                    # even if the protocol player is not the active protocol
+                    volume_options.append(
                         ConfigValueOption(
-                            title=linked_protocol.name, value=linked_protocol.output_protocol_id
+                            title=protocol_player.provider.name,
+                            value=protocol_player.player_id,
                         )
                     )
-                if protocol_player.supports_feature(PlayerFeature.VOLUME_MUTE):
-                    base_mute_options.append(
+            if protocol_player.supports_feature(PlayerFeature.VOLUME_MUTE):
+                if auto_option not in mute_options:
+                    mute_options.append(auto_option)
+                if linked_protocol.protocol_domain in ("chromecast", "dlna"):
+                    # for chromecast/dlna we can use the protocol player for volume control
+                    # even if the protocol player is not the active protocol
+                    mute_options.append(
                         ConfigValueOption(
-                            title=linked_protocol.name,
-                            value=linked_protocol.output_protocol_id,
+                            title=protocol_player.provider.name,
+                            value=protocol_player.player_id,
                         )
                     )
+
         # append none+fake options
-        base_power_options += [
+        power_options += [
             ConfigValueOption(title="None", value=PLAYER_CONTROL_NONE),
             ConfigValueOption(title="Fake power control", value=PLAYER_CONTROL_FAKE),
         ]
-        base_volume_options += [
+        volume_options += [
             ConfigValueOption(title="None", value=PLAYER_CONTROL_NONE),
         ]
-        base_mute_options.append(ConfigValueOption(title="None", value=PLAYER_CONTROL_NONE))
+        mute_options.append(ConfigValueOption(title="None", value=PLAYER_CONTROL_NONE))
         if player.supports_feature(PlayerFeature.VOLUME_SET):
-            base_mute_options.append(
+            mute_options.append(
                 ConfigValueOption(title="Fake mute control", value=PLAYER_CONTROL_FAKE)
             )
 
@@ -1808,12 +1907,10 @@ class ConfigController:
                 key=CONF_POWER_CONTROL,
                 type=ConfigEntryType.STRING,
                 label="Power Control",
-                default_value=base_power_options[0].value
-                if base_power_options
-                else PLAYER_CONTROL_NONE,
+                default_value=power_options[0].value if power_options else PLAYER_CONTROL_NONE,
                 required=False,
                 options=[
-                    *base_power_options,
+                    *power_options,
                     *(ConfigValueOption(x.name, x.id) for x in power_controls),
                 ],
                 category="player_controls",
@@ -1823,12 +1920,10 @@ class ConfigController:
                 key=CONF_VOLUME_CONTROL,
                 type=ConfigEntryType.STRING,
                 label="Volume Control",
-                default_value=base_volume_options[0].value
-                if base_volume_options
-                else PLAYER_CONTROL_NONE,
+                default_value=volume_options[0].value if volume_options else PLAYER_CONTROL_NONE,
                 required=True,
                 options=[
-                    *base_volume_options,
+                    *volume_options,
                     *(ConfigValueOption(x.name, x.id) for x in volume_controls),
                 ],
                 category="player_controls",
@@ -1838,12 +1933,10 @@ class ConfigController:
                 key=CONF_MUTE_CONTROL,
                 type=ConfigEntryType.STRING,
                 label="Mute Control",
-                default_value=base_mute_options[0].value
-                if base_mute_options
-                else PLAYER_CONTROL_NONE,
+                default_value=mute_options[0].value if mute_options else PLAYER_CONTROL_NONE,
                 required=True,
                 options=[
-                    *base_mute_options,
+                    *mute_options,
                     *[ConfigValueOption(x.name, x.id) for x in mute_controls],
                 ],
                 category="player_controls",
@@ -1870,9 +1963,9 @@ class ConfigController:
 
         # Build options from available output protocols, sorted by priority
         options: list[ConfigValueOption] = []
-        default_value: str | None = None
 
         # Add each available output protocol as an option, sorted by priority
+        has_native = False
         for protocol in sorted(output_protocols, key=lambda p: p.priority):
             if provider_manifest := self.mass.get_provider_manifest(protocol.protocol_domain):
                 protocol_name = provider_manifest.name
@@ -1884,9 +1977,13 @@ class ConfigController:
                 title = f"{protocol_name} (native)" if protocol.is_native else protocol_name
                 value = "native" if protocol.is_native else protocol.output_protocol_id
                 options.append(ConfigValueOption(title=title, value=value))
-                # First available protocol becomes the default (highest priority)
-                if default_value is None:
-                    default_value = str(value)
+                has_native = has_native or protocol.is_native
+
+        if has_native:
+            default_value = "native"
+        else:
+            default_value = "auto"
+            options.append(ConfigValueOption(title="Auto-select", value="auto"))
 
         all_entries.append(
             ConfigEntry(
@@ -1894,7 +1991,7 @@ class ConfigController:
                 type=ConfigEntryType.STRING,
                 label="Preferred Output Protocol",
                 description="Select the preferred protocol for audio playback to this device.",
-                default_value=default_value or "native",
+                default_value=default_value,
                 required=True,
                 options=options,
                 category="protocol_general",

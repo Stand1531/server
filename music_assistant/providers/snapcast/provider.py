@@ -81,6 +81,11 @@ class SnapCastProvider(PlayerProvider):
     _snapcast_ma_streams_lock: asyncio.Lock
 
     @property
+    def supports_dynamic_leader_switching(self) -> bool:
+        """Return True: Snapcast supports removing the leader without stream teardown."""
+        return True
+
+    @property
     def queue_control_available(self) -> bool:
         """Return whether queue-based control scripts are available.
 
@@ -254,9 +259,9 @@ class SnapCastProvider(PlayerProvider):
                 )
                 attr_name = f"zc_service_set{name}"
                 if getattr(self, attr_name, None):
-                    await self.mass.aiozc.async_update_service(info)
+                    await self.mass.discovery.aiozc.async_update_service(info)
                 else:
-                    await self.mass.aiozc.async_register_service(info, strict=False)
+                    await self.mass.discovery.aiozc.async_register_service(info, strict=False)
                 setattr(self, attr_name, True)
             except NonUniqueNameException:
                 self.logger.debug(
