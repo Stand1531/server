@@ -114,108 +114,6 @@ SUPPORTED_FEATURES = {
     ProviderFeature.RECOMMENDATIONS,
 }
 
-import urllib3
-from urllib3.exceptions import InsecureRequestWarning
-
-urllib3.disable_warnings(InsecureRequestWarning)
-
-def resolve_plex_server(
-    local_server_ip: str,
-    local_server_port: int,
-    local_server_ssl: bool,
-    local_server_verify_cert: bool,
-    auth_token: str | None,
-    myplex_account: MyPlexAccount | None = None,
-    client_id: str | None = None,
-    client_version: str | None = None,
-) -> PlexServer:
-    """
-    Connect to a Plex server either via local direct connection or via Plex.tv account.
-
-    :param local_server_ip: Local IP address of the Plex server
-    :param local_server_port: Local port of the Plex server
-    :param local_server_ssl: Use HTTPS for local connection
-    :param local_server_verify_cert: Verify SSL certificate
-    :param auth_token: Plex auth token (or AUTH_TOKEN_UNAUTH for local)
-    :param myplex_account: Optional MyPlexAccount object
-    :return: PlexServer instance
-    :raises LoginFailed: if authentication fails or server not found
-    """
-
-    # silence loggers
-    logging.getLogger("plexapi").setLevel(logging.WARNING)
-
-    local_server_protocol = "https" if local_server_ssl else "http"
-    base_url = f"{local_server_protocol}://{local_server_ip}:{local_server_port}"
-
-    session = requests.Session()
-    session.verify = local_server_verify_cert
-    session.headers.update(
-        {
-            "X-Plex-Client-Identifier": client_id,
-            "X-Plex-Product": "Music Assistant",
-            "X-Plex-Platform": "Music Assistant",
-            "X-Plex-Version": client_version,
-        }
-    )
-    plex_server: PlexServer | None = None
-
-    # MyPlex authentication path
-    if auth_token and auth_token != AUTH_TOKEN_UNAUTH:
-
-        # Ensure we have a MyPlexAccount
-        if not myplex_account:
-            try:
-                myplex_account = MyPlexAccount(token=auth_token)
-            except Exception as err:
-                raise LoginFailed("Failed to authenticate with Plex.tv") from err
-
-        try:
-            for resource in myplex_account.resources():
-
-                if "server" not in resource.provides:
-                    continue
-
-                # Match server by address/port
-                for conn in resource.connections:
-                    if (
-                        conn.address == local_server_ip
-                        and int(conn.port) == int(local_server_port)
-                    ):
-
-                        logging.getLogger("music_assistant.providers.plex").info(
-                            "Matched Plex resource '%s' (owned=%s)",
-                            resource.name,
-                            resource.owned,
-                        )
-                        # If owned use auth_token
-                        # If shared use resource.accessToken
-                        token = (
-                            auth_token if resource.owned else resource.accessToken
-                        )
-
-                        plex_server = PlexServer(
-                            f"{conn.protocol}://{conn.address}:{conn.port}",
-                            token=token,
-                            session=session,
-                        )
-                        break
-                if plex_server:
-                    break
-
-        except plexapi.exceptions.Unauthorized as err:
-            raise LoginFailed(f"Server {local_server_ip}:{local_server_port} not accessible in your Plex account") from err
-
-
-    # Local-only path
-    if auth_token == AUTH_TOKEN_UNAUTH:
-        # Local connection
-        plex_server = PlexServer(base_url, session=session)
-
-    if plex_server is None:
-        raise LoginFailed(f"Plex server {local_server_ip}:{local_server_port} not found")
-
-    return plex_server
 
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
@@ -385,32 +283,17 @@ async def get_config_entries(  # noqa: PLR0915
             server_http_port = str(values.get(CONF_LOCAL_SERVER_PORT))
             server_http_ssl = bool(values.get(CONF_LOCAL_SERVER_SSL))
             server_http_verify_cert = bool(values.get(CONF_LOCAL_SERVER_VERIFY_CERT))
-            
-            # Fetch libraries
-            plex_server = await asyncio.to_thread(
-                resolve_plex_server,
-                local_server_ip=server_http_ip,
-                local_server_port=server_http_port,
-                local_server_ssl=server_http_ssl,
-                local_server_verify_cert=server_http_verify_cert,
-                auth_token=token,
-                myplex_account=None,
-                client_id=instance_id,
-                client_version=mass.version,
-            )
-
-            # Fetch libraries
-            libraries = await get_libraries(
-                mass,
-                token,
-                server_http_ssl,
-                server_http_ip,
-                server_http_port,
-                server_http_verify_cert,
-                instance_id,
-                plex_server=plex_server,
-            )
-            if not libraries:
+            if not (
+                libraries := await get_libraries(
+                    mass,
+                    token,
+                    server_http_ssl,
+                    server_http_ip,
+                    server_http_port,
+                    server_http_verify_cert,
+                    instance_id,
+                )
+            ):
                 msg = "Unable to retrieve Servers and/or Music Libraries"
                 raise LoginFailed(msg)
             conf_libraries.options = [
@@ -556,7 +439,6 @@ class PlexProvider(MusicProvider):
 
     async def handle_async_init(self) -> None:
         """Set up the music provider by connecting to the server."""
-<<<<<<< dev
         # silence loggers
         logging.getLogger("plexapi").setLevel(self.logger.level + 10)
         _, library_name = str(self.config.get_value(CONF_LIBRARY_ID)).split(" / ", 1)
@@ -617,38 +499,12 @@ class PlexProvider(MusicProvider):
                     raise LoginFailed(msg)
                 raise LoginFailed from err
             return plex_server
-=======
-        # Parse library name
-        _, library_name = str(self.config.get_value(CONF_LIBRARY_ID)).split(" / ", 1)
 
-        local_server_ip = self.config.get_value(CONF_LOCAL_SERVER_IP)
-        local_server_port = self.config.get_value(CONF_LOCAL_SERVER_PORT)
-        local_server_ssl = self.config.get_value(CONF_LOCAL_SERVER_SSL)
-        local_server_verify_cert = self.config.get_value(CONF_LOCAL_SERVER_VERIFY_CERT)
-        token = self.config.get_value(CONF_AUTH_TOKEN)
-
-        # Get MyPlex account if token is not local auth
-        if token != AUTH_TOKEN_UNAUTH:
-            self._myplex_account = await self.get_myplex_account_and_refresh_token(str(token))
-
-        def connect():
-
-            return resolve_plex_server(
-                local_server_ip=local_server_ip,
-                local_server_port=local_server_port,
-                local_server_ssl=local_server_ssl,
-                local_server_verify_cert=local_server_verify_cert,
-                auth_token=token,
-                myplex_account=self._myplex_account,
-                client_id=self.instance_id,
-                client_version=self.mass.version,
-            )
->>>>>>> 4892-myplex-auth
-
+        self._myplex_account = await self.get_myplex_account_and_refresh_token(
+            str(self.config.get_value(CONF_AUTH_TOKEN))
+        )
         try:
             self._plex_server = await self._run_async(connect)
-            self._baseurl = self._plex_server._baseurl
-            # Select library
             self._plex_library = await self._run_async(
                 self._plex_server.library.section, library_name
             )
@@ -1470,14 +1326,11 @@ class PlexProvider(MusicProvider):
             return self._myplex_account
 
         def _refresh_plex_token() -> MyPlexAccount:
-            try:
-                if self._myplex_account is None:
-                    myplex_account = MyPlexAccount(token=auth_token)
-                    self._myplex_account = myplex_account
-                self._myplex_account.ping()
-                return self._myplex_account
-            except plexapi.exceptions.Unauthorized as err:
-                raise LoginFailed("Plex.tv authentication failed") from err
+            if self._myplex_account is None:
+                myplex_account = MyPlexAccount(token=auth_token)
+                self._myplex_account = myplex_account
+            self._myplex_account.ping()
+            return self._myplex_account
 
         return await asyncio.to_thread(_refresh_plex_token)
 
