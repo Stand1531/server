@@ -6,8 +6,7 @@ import asyncio
 import logging
 import os
 import shutil
-import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from contextlib import suppress
 from copy import deepcopy
 from datetime import datetime
@@ -15,7 +14,7 @@ from itertools import zip_longest
 from math import inf
 from typing import TYPE_CHECKING, Any, Final, cast
 
-import numpy as np
+from music_assistant_models.background_task import BackgroundTask, TaskMetadata, TaskSchedule
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
 from music_assistant_models.enums import (
     ConfigEntryType,
@@ -23,8 +22,10 @@ from music_assistant_models.enums import (
     MediaType,
     ProviderFeature,
     ProviderType,
+    TaskStatus,
 )
 from music_assistant_models.errors import (
+    InvalidDataError,
     InvalidProviderID,
     InvalidProviderURI,
     MediaNotFoundError,
@@ -32,17 +33,20 @@ from music_assistant_models.errors import (
 )
 from music_assistant_models.helpers import get_global_cache_value
 from music_assistant_models.media_items import (
+    Album,
     Artist,
     AudioFormat,
     BrowseFolder,
+    Genre,
     ItemMapping,
     MediaItemType,
+    Playlist,
+    Podcast,
     ProviderMapping,
     RecommendationFolder,
     SearchResults,
     Track,
 )
-from music_assistant_models.provider import SyncTask
 from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.constants import (
@@ -50,7 +54,9 @@ from music_assistant.constants import (
     DB_TABLE_ALBUM_TRACKS,
     DB_TABLE_ALBUMS,
     DB_TABLE_ARTISTS,
+    DB_TABLE_AUDIO_ANALYSIS,
     DB_TABLE_AUDIOBOOKS,
+    DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION,
     DB_TABLE_GENRE_MEDIA_ITEM_MAPPING,
     DB_TABLE_GENRES,
     DB_TABLE_LOUDNESS_MEASUREMENTS,
@@ -60,25 +66,27 @@ from music_assistant.constants import (
     DB_TABLE_PROVIDER_MAPPINGS,
     DB_TABLE_RADIOS,
     DB_TABLE_SETTINGS,
-    DB_TABLE_SMART_FADES_ANALYSIS,
     DB_TABLE_TRACK_ARTISTS,
     DB_TABLE_TRACKS,
     DEFAULT_GENRE_MAPPING,
     PROVIDERS_WITH_SHAREABLE_URLS,
 )
-from music_assistant.controllers.streams.smart_fades.fades import SMART_CROSSFADE_DURATION
+from music_assistant.controllers.tasks.context import update_current_task_progress_text
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.compare import compare_strings, compare_version, create_safe_string
 from music_assistant.helpers.database import UNSET, DatabaseConnection
-from music_assistant.helpers.datetime import utc_timestamp
+from music_assistant.helpers.datetime import (
+    from_utc_timestamp,
+    local_clock_time_to_utc,
+    utc_timestamp,
+)
 from music_assistant.helpers.json import json_dumps, json_loads, serialize_to_json
 from music_assistant.helpers.tags import split_artists
 from music_assistant.helpers.uri import parse_uri
 from music_assistant.helpers.util import TaskManager, parse_optional_bool, parse_title_and_version
 from music_assistant.models.core_controller import CoreController
 from music_assistant.models.music_provider import MusicProvider
-from music_assistant.models.smart_fades import SmartFadesAnalysis, SmartFadesAnalysisFragment
 
 from .media.albums import AlbumsController
 from .media.artists import ArtistsController
@@ -101,12 +109,12 @@ CONF_RESET_DB = "reset_db"
 DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
-DB_SCHEMA_VERSION: Final[int] = 30
+DB_SCHEMA_VERSION: Final[int] = 37
 
-CACHE_CATEGORY_LAST_SYNC: Final[int] = 9
 CACHE_CATEGORY_SEARCH_RESULTS: Final[int] = 10
-LAST_PROVIDER_INSTANCE_SCAN: Final[str] = "last_provider_instance_scan"
-PROVIDER_INSTANCE_SCAN_INTERVAL: Final[int] = 30 * 24 * 60 * 60  # one month in seconds
+DATABASE_CLEANUP_TASK_ID: Final[str] = "music_database_cleanup"
+PROVIDER_MAPPING_CORRECTION_TASK_ID: Final[str] = "music_provider_mapping_correction"
+MUSIC_SYNC_COMPLETION_CHECK_TASK_ID: Final[str] = "music_sync_completion_check"
 
 
 class MusicController(CoreController):
@@ -127,7 +135,6 @@ class MusicController(CoreController):
         self.audiobooks = AudiobooksController(self.mass)
         self.podcasts = PodcastsController(self.mass)
         self.genres = GenreController(self.mass)
-        self.in_progress_syncs: list[SyncTask] = []
         self._database: DatabaseConnection | None = None
         self._sync_lock = asyncio.Lock()
         self.manifest.name = "Music controller"
@@ -185,13 +192,12 @@ class MusicController(CoreController):
             self.domain, CONF_DELETED_PROVIDERS, []
         ):
             await self.cleanup_provider(removed_provider)
-        # schedule cleanup task for matching provider instances
-        last_scan = cast(
-            "int",
-            self.mass.config.get_raw_core_config_value(self.domain, LAST_PROVIDER_INSTANCE_SCAN, 0),
-        )
-        if time.time() - last_scan > PROVIDER_INSTANCE_SCAN_INTERVAL:
-            self.mass.call_later(60, self.correct_multi_instance_provider_mappings)
+
+    async def post_setup(self) -> None:
+        """Handle logic after all core controllers have been set up."""
+        self._register_database_cleanup_task()
+        self._register_provider_mapping_correction_task()
+        self.genres.register_scheduled_scan_task()
 
     async def close(self) -> None:
         """Cleanup on exit."""
@@ -204,11 +210,7 @@ class MusicController(CoreController):
 
     async def on_provider_unload(self, provider: MusicProvider) -> None:
         """Handle logic when a provider is (about to get) unloaded."""
-        # make sure to stop any running sync tasks first
-        for sync_task in list(self.in_progress_syncs):
-            if sync_task.provider_instance == provider.instance_id:
-                if sync_task.task:
-                    sync_task.task.cancel()
+        self.unschedule_provider_sync(provider.instance_id)
 
     @property
     def providers(self) -> list[MusicProvider]:
@@ -231,12 +233,14 @@ class MusicController(CoreController):
         self,
         media_types: list[MediaType] | None = None,
         providers: list[str] | None = None,
-    ) -> None:
-        """Start running the sync of (all or selected) musicproviders.
+    ) -> list[BackgroundTask]:
+        """
+        Start running the sync of (all or selected) musicproviders.
 
         media_types: only sync these media types. None for all.
         providers: only sync these provider instances. None for all.
         """
+        tasks: list[BackgroundTask] = []
         if media_types is None:
             media_types = MediaType.ALL
         if providers is None:
@@ -255,12 +259,34 @@ class MusicController(CoreController):
                 )
                 if not sync_conf:
                     continue
-                self._start_provider_sync(provider, media_type)
+                await self._schedule_provider_mediatype_sync(provider, media_type, True)
+                task_id = self._get_sync_task_id(provider, media_type)
+                try:
+                    tasks.append(self.mass.tasks.run_task(task_id))
+                except InvalidDataError:
+                    tasks.append(
+                        self.mass.tasks.run_background_task(
+                            task_id=task_id,
+                            name=self._get_sync_task_name(provider, media_type),
+                            handler=self._create_provider_sync_handler(provider, media_type),
+                            translation_key=self._get_sync_task_translation_key(media_type),
+                            translation_args=[provider.name],
+                            user_id=get_current_user().user_id if get_current_user() else None,
+                            metadata=self._get_sync_task_metadata(provider, media_type),
+                            allow_retry=True,
+                            priority=True,
+                        )
+                    )
+        return tasks
 
-    @api_command("music/synctasks")
-    def get_running_sync_tasks(self) -> list[SyncTask]:
-        """Return list with providers that are currently (scheduled for) syncing."""
-        return self.in_progress_syncs
+    @property
+    def active_sync_tasks(self) -> list[BackgroundTask]:
+        """Return provider sync tasks that are currently pending or running."""
+        return [
+            task
+            for task in self.mass.tasks.get_tasks_by_metadata(task_domain="music_sync")
+            if task.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+        ]
 
     @api_command("music/search")
     async def search(
@@ -279,9 +305,12 @@ class MusicController(CoreController):
         # use cache to avoid repeated searches
         search_providers = sorted(self.get_unique_providers())
         cache_provider_key = "library" if library_only else ",".join(search_providers)
-        cache_key = f"{search_query}{'-'.join(sorted([mt.value for mt in media_types]))}-{limit}-{library_only}-{cache_provider_key}"  # noqa: E501
+        cache_key = f"{search_query}{'-'.join(sorted([mt.value for mt in media_types]))}-{limit}-{library_only}-{cache_provider_key}"
         if cache := await self.mass.cache.get(
-            key=cache_key, provider=self.domain, category=CACHE_CATEGORY_SEARCH_RESULTS
+            key=cache_key,
+            provider=self.domain,
+            category=CACHE_CATEGORY_SEARCH_RESULTS,
+            base_class=SearchResults,
         ):
             return cache
         if not media_types:
@@ -415,7 +444,7 @@ class MusicController(CoreController):
         result.podcasts = self._sort_search_result(search_query, result.podcasts)
         await self.mass.cache.set(
             key=cache_key,
-            data=result,
+            data=result.to_dict(),
             expiration=600,
             provider=self.domain,
             category=CACHE_CATEGORY_SEARCH_RESULTS,
@@ -648,28 +677,53 @@ class MusicController(CoreController):
         """Return a list of the Audiobooks and PodcastEpisodes that are in progress."""
         available_providers = ("library", *self.get_unique_providers())
         available_providers_str = "(" + ",".join(f'"{x}"' for x in available_providers) + ")"
+
+        # An audiobook can be part of the library, in contrast to podcast episodes.
+        # We then need to check the provider mappings table.
+        one_week_ago = int(utc_timestamp()) - (7 * 86400)
         query = (
-            f"SELECT * FROM {DB_TABLE_PLAYLOG} "
-            f"WHERE media_type in ('audiobook', 'podcast_episode') AND fully_played = 0 "
-            f"AND provider in {available_providers_str} "
-            "AND seconds_played > 0 "
+            "SELECT p.item_id, p.media_type, p.name, p.image, p.provider "
+            f"FROM {DB_TABLE_PLAYLOG} p "
+            "WHERE p.media_type IN ('audiobook', 'podcast_episode') "
+            "AND p.fully_played = 0 "
+            "AND p.seconds_played > 0 "
+            f"AND (p.media_type != 'podcast_episode' OR p.timestamp >= {one_week_ago}) "
+        )
+        query += (
+            "AND ( "
+            "CASE WHEN p.provider = 'library' THEN "
+            f"EXISTS (SELECT 1 FROM {DB_TABLE_PROVIDER_MAPPINGS} m "
+            "WHERE m.item_id = p.item_id AND m.media_type = p.media_type "
         )
         if not all_users and (user := get_current_user()):
-            query += f"AND userid = '{user.user_id}' "
-
+            filter_for_str = available_providers_str
+            if user.provider_filter:
+                filter_for_str = "(" + ",".join(f'"{x}"' for x in user.provider_filter) + ")"
+            query += (
+                f"AND m.provider_instance IN {filter_for_str} "
+                f"AND m.provider_instance IN {available_providers_str} "
+                ") "
+                f"ELSE (p.provider IN {filter_for_str} AND p.provider IN {available_providers_str})"
+                "END "
+                ") "
+                f"AND p.userid = '{user.user_id}' "
+            )
+        else:
+            # for a library item, we still have to verify via the provider mapping table
+            # that the provider is available
+            query += (
+                f"AND m.provider_instance IN {available_providers_str} "
+                ") "
+                f"ELSE p.provider IN {available_providers_str} "
+                "END "
+                ") "
+            )
         query += "ORDER BY timestamp DESC"
+
         db_rows = await self.mass.music.database.get_rows_from_query(query, limit=limit)
         result: list[ItemMapping] = []
-
-        # Get user provider filter if set
-        user = get_current_user()
-        user_provider_filter = user.provider_filter if user and user.provider_filter else None
-
         for db_row in db_rows:
             provider = db_row["provider"]
-            # Apply user provider filter
-            if user_provider_filter and provider not in user_provider_filter:
-                continue
             result.append(
                 ItemMapping.from_dict(
                     {
@@ -732,13 +786,16 @@ class MusicController(CoreController):
         return result
 
     @api_command("music/item_by_uri")
-    async def get_item_by_uri(self, uri: str) -> MediaItemType | BrowseFolder:
+    async def get_item_by_uri(
+        self, uri: str, allow_update_metadata: bool = False
+    ) -> MediaItemType | BrowseFolder:
         """Fetch MediaItem by uri."""
         media_type, provider_instance_id_or_domain, item_id = await parse_uri(uri)
         return await self.get_item(
             media_type=media_type,
             item_id=item_id,
             provider_instance_id_or_domain=provider_instance_id_or_domain,
+            allow_update_metadata=allow_update_metadata,
         )
 
     @api_command("music/recommendations")
@@ -764,6 +821,7 @@ class MusicController(CoreController):
         media_type: MediaType,
         item_id: str,
         provider_instance_id_or_domain: str,
+        allow_update_metadata: bool = True,
     ) -> MediaItemType | BrowseFolder:
         """Get single music item by id and media type."""
         if provider_instance_id_or_domain == "database":
@@ -786,6 +844,7 @@ class MusicController(CoreController):
         return await ctrl.get(
             item_id=item_id,
             provider_instance_id_or_domain=provider_instance_id_or_domain,
+            allow_update_metadata=allow_update_metadata,
         )
 
     @api_command("music/get_library_item")
@@ -1058,71 +1117,6 @@ class MusicController(CoreController):
             values["loudness_album"] = album_loudness
         await self.database.insert_or_replace(DB_TABLE_LOUDNESS_MEASUREMENTS, values)
 
-    async def set_smart_fades_analysis(
-        self,
-        item_id: str,
-        provider_instance_id_or_domain: str,
-        analysis: SmartFadesAnalysis,
-    ) -> None:
-        """Store Smart Fades BPM analysis for a track in db."""
-        if not (provider := self.mass.get_provider(provider_instance_id_or_domain)):
-            return
-        if (
-            analysis.duration <= 0.75 * SMART_CROSSFADE_DURATION
-            or analysis.bpm <= 0
-            or analysis.confidence < 0
-        ):
-            # skip invalid values, we skip analysis that were performed on
-            # a short amount of audio as those are often unreliable
-            return
-        beats_json = await asyncio.to_thread(lambda: json_dumps(analysis.beats.tolist()))
-        downbeats_json = await asyncio.to_thread(lambda: json_dumps(analysis.downbeats.tolist()))
-        # prefer domain for streaming providers as the catalog is the same across instances
-        prov_key = provider.domain if provider.is_streaming_provider else provider.instance_id
-        values = {
-            "fragment": analysis.fragment.value,
-            "item_id": item_id,
-            "provider": prov_key,
-            "bpm": analysis.bpm,
-            "beats": beats_json,
-            "downbeats": downbeats_json,
-            "confidence": analysis.confidence,
-            "duration": analysis.duration,
-        }
-        await self.database.insert_or_replace(DB_TABLE_SMART_FADES_ANALYSIS, values)
-
-    async def get_smart_fades_analysis(
-        self,
-        item_id: str,
-        provider_instance_id_or_domain: str,
-        fragment: SmartFadesAnalysisFragment,
-    ) -> SmartFadesAnalysis | None:
-        """Get Smart Fades BPM analysis for a track from db."""
-        if not (provider := self.mass.get_provider(provider_instance_id_or_domain)):
-            return None
-        # prefer domain for streaming providers as the catalog is the same across instances
-        prov_key = provider.domain if provider.is_streaming_provider else provider.instance_id
-        db_row = await self.database.get_row(
-            DB_TABLE_SMART_FADES_ANALYSIS,
-            {
-                "item_id": item_id,
-                "provider": prov_key,
-                "fragment": fragment.value,
-            },
-        )
-        if db_row and db_row["bpm"] > 0:
-            beats = await asyncio.to_thread(lambda: np.array(json_loads(db_row["beats"])))
-            downbeats = await asyncio.to_thread(lambda: np.array(json_loads(db_row["downbeats"])))
-            return SmartFadesAnalysis(
-                fragment=SmartFadesAnalysisFragment(db_row["fragment"]),
-                bpm=float(db_row["bpm"]),
-                beats=beats,
-                downbeats=downbeats,
-                confidence=float(db_row["confidence"]),
-                duration=float(db_row["duration"]),
-            )
-        return None
-
     async def get_loudness(
         self,
         item_id: str,
@@ -1221,6 +1215,17 @@ class MusicController(CoreController):
                     params,
                     allow_replace=True,
                 )
+
+        # Set seconds_played in accordance with fully_played, if the media_item has
+        # a duration, before it is forwarded to music_providers
+        if seconds_played is None:
+            seconds_played = 0
+            if (
+                fully_played
+                and not isinstance(media_item, Album | Artist | Genre | Playlist | Podcast)
+                and isinstance(media_item.duration, int)  # for Radio duration can be None
+            ):
+                seconds_played = media_item.duration
 
         # forward to provider(s) to sync resume state (e.g. for audiobooks)
         for prov_mapping in media_item.provider_mappings:
@@ -1418,9 +1423,35 @@ class MusicController(CoreController):
         """
         provider_fully_played = False
         provider_position_ms = 0
+        provider_timestamp: datetime | None = None
+
+        user: User | None = None
+        if userid:
+            # userid overridden by parameter
+            user = await self.mass.webserver.auth.get_user(userid)
+        elif session_user := get_current_user():
+            # this is the active session user that triggered the action
+            user = session_user
+        elif provider_user := await self._get_user_for_provider(media_item.provider_mappings):
+            # based on configured provider filter we can try to find a user
+            user = provider_user
+
+        provider_instances = {x.provider_instance for x in media_item.provider_mappings}
+        if user and user.provider_filter:
+            # only if the user has provider filters configured
+            # otherwise we allow all providers
+            preferred_provider_instances = provider_instances.intersection(user.provider_filter)
+        else:
+            preferred_provider_instances = provider_instances
+
+        preferred_providers = [
+            x
+            for x in media_item.provider_mappings
+            if x.provider_instance in preferred_provider_instances
+        ]
 
         # Try to get position from providers
-        for prov_mapping in media_item.provider_mappings:
+        for prov_mapping in preferred_providers:
             if not (
                 provider := self.mass.get_provider(
                     prov_mapping.provider_instance, provider_type=MusicProvider
@@ -1431,12 +1462,14 @@ class MusicController(CoreController):
                 (
                     provider_fully_played,
                     provider_position_ms,
+                    provider_timestamp,
                 ) = await provider.get_resume_position(prov_mapping.item_id, media_item.media_type)
                 break  # Use first provider that returns data
 
         # Get MA's internal position from playlog
         ma_fully_played = False
         ma_position_ms = 0
+        ma_timestamp = from_utc_timestamp(0)
         params = {
             "media_type": media_item.media_type.value,
             "item_id": media_item.item_id,
@@ -1444,10 +1477,15 @@ class MusicController(CoreController):
         }
         if userid:
             params["userid"] = userid
+        elif user:
+            params["userid"] = user.user_id
         if db_entry := await self.database.get_row(DB_TABLE_PLAYLOG, params):
             ma_position_ms = db_entry["seconds_played"] * 1000 if db_entry["seconds_played"] else 0
             ma_fully_played = parse_optional_bool(db_entry["fully_played"])
+            ma_timestamp = from_utc_timestamp(db_entry["timestamp"])
 
+        if provider_timestamp is not None and provider_timestamp > ma_timestamp:
+            return provider_fully_played, provider_position_ms
         # Return the higher position to ensure users never lose progress
         if ma_position_ms >= provider_position_ms:
             return ma_fully_played, ma_position_ms
@@ -1620,22 +1658,39 @@ class MusicController(CoreController):
         """Schedule Library sync for given provider."""
         if not (provider := self.mass.get_provider(provider_instance_id)):
             return
-        self.unschedule_provider_sync(provider.instance_id)
+        self.unschedule_provider_sync(provider.instance_id, clear_persisted_state=False)
         for media_type in MediaType:
             if not provider.library_supported(media_type):
                 continue
             await self._schedule_provider_mediatype_sync(provider, media_type, True)
 
-    def unschedule_provider_sync(self, provider_instance_id: str) -> None:
-        """Unschedule Library sync for given provider."""
-        # cancel all scheduled sync tasks
+    def unschedule_provider_sync(
+        self, provider_instance_id: str, clear_persisted_state: bool = True
+    ) -> None:
+        """Unschedule Library sync for given provider.
+
+        :param provider_instance_id: The provider instance id to unschedule.
+        :param clear_persisted_state: Whether to remove persisted schedule state from config.
+        """
         for media_type in MediaType:
-            key = f"sync_{provider_instance_id}_{media_type.value}"
-            self.mass.cancel_timer(key)
-        # cancel any running sync tasks
-        for sync_task in list(self.in_progress_syncs):
-            if sync_task.provider_instance == provider_instance_id:
-                sync_task.task.cancel()
+            self.mass.tasks.unregister_scheduled_task(
+                self._get_sync_task_id(provider_instance_id, media_type),
+                clear_persisted_state=clear_persisted_state,
+            )
+
+    def get_provider_sync_schedule(
+        self, provider_instance_id: str, media_type: MediaType
+    ) -> TaskSchedule | None:
+        """Return the effective schedule for a provider sync task, if any."""
+        task_id = self._get_sync_task_id(provider_instance_id, media_type)
+        with suppress(InvalidDataError):
+            task = self.mass.tasks.get_task(task_id)
+            return task.schedule
+        if not (provider := self.mass.get_provider(provider_instance_id)):
+            return None
+        if not provider.library_supported(media_type):
+            return None
+        return provider.get_default_library_sync_schedule(media_type)
 
     def match_provider_instances(
         self,
@@ -1832,70 +1887,113 @@ class MusicController(CoreController):
             )
             return []
 
-    def _start_provider_sync(self, provider: MusicProvider, media_type: MediaType) -> None:
-        """Start sync task on provider and track progress."""
-        # check if we're not already running a sync task for this provider/mediatype
-        for sync_task in list(self.in_progress_syncs):
-            if sync_task.provider_instance != provider.instance_id:
-                continue
-            if sync_task.task.done():
-                continue
-            if media_type in sync_task.media_types:
-                self.logger.debug(
-                    "Skip sync task for %s/%ss because another task is already in progress",
-                    provider.name,
-                    media_type.value,
-                )
-                return
+    def _create_provider_sync_handler(
+        self, provider: MusicProvider, media_type: MediaType
+    ) -> Callable[[], Awaitable[None]]:
+        """Create the coroutine used for a managed provider sync task."""
 
         async def run_sync() -> None:
-            # Wrap the provider sync into a lock to prevent
-            # race conditions when multiple providers are syncing at the same time.
-            async with self._sync_lock:
-                await provider.sync_library(media_type)
+            try:
+                async with self._sync_lock:
+                    await provider.sync_library(media_type)
+            finally:
+                self.mass.call_later(
+                    0,
+                    self._handle_sync_completion_check,
+                    task_id=MUSIC_SYNC_COMPLETION_CHECK_TASK_ID,
+                )
 
-        # we keep track of running sync tasks
-        task = self.mass.create_task(run_sync())
-        sync_spec = SyncTask(
-            provider_domain=provider.domain,
-            provider_instance=provider.instance_id,
-            media_types=(media_type,),
-            task=task,
+        return run_sync
+
+    def _get_sync_task_id(self, provider: MusicProvider | str, media_type: MediaType) -> str:
+        """Return deterministic task id for a provider sync."""
+        provider_instance = (
+            provider.instance_id if isinstance(provider, MusicProvider) else provider
         )
-        self.in_progress_syncs.append(sync_spec)
+        return f"music_sync_{provider_instance}_{media_type.value}"
 
-        self.mass.signal_event(EventType.SYNC_TASKS_UPDATED, data=self.in_progress_syncs)
+    def _get_sync_task_name(self, provider: MusicProvider, media_type: MediaType) -> str:
+        """Return display name for a provider sync task."""
+        return f"Sync {provider.name} {media_type.value}s"
 
-        def on_sync_task_done(task: asyncio.Task) -> None:
-            self.in_progress_syncs.remove(sync_spec)
-            if task.cancelled():
-                return
-            if task_err := task.exception():
-                self.logger.warning(
-                    "Sync task for %s/%ss completed with errors",
-                    provider.name,
-                    media_type.value,
-                    exc_info=task_err if self.logger.isEnabledFor(10) else None,
-                )
-            else:
-                self.logger.info("Sync task for %s/%ss completed", provider.name, media_type.value)
-            self.mass.signal_event(EventType.SYNC_TASKS_UPDATED, data=self.in_progress_syncs)
-            self.mass.create_task(
-                self.mass.cache.set(
-                    key=media_type.value,
-                    data=self.mass.loop.time(),
-                    provider=provider.instance_id,
-                    category=CACHE_CATEGORY_LAST_SYNC,
-                )
-            )
-            # schedule db cleanup after sync
-            if not self.in_progress_syncs:
-                self.mass.create_task(self._cleanup_database())
-            # reschedule next execution
-            self.mass.create_task(self._schedule_provider_mediatype_sync(provider, media_type))
+    def _get_sync_task_translation_key(self, media_type: MediaType) -> str:
+        """Return translation key for a provider sync task."""
+        if media_type == MediaType.ARTIST:
+            return "background_task.sync_provider_artists"
+        if media_type == MediaType.ALBUM:
+            return "background_task.sync_provider_albums"
+        if media_type == MediaType.TRACK:
+            return "background_task.sync_provider_tracks"
+        if media_type == MediaType.PLAYLIST:
+            return "background_task.sync_provider_playlists"
+        if media_type == MediaType.RADIO:
+            return "background_task.sync_provider_radios"
+        if media_type == MediaType.AUDIOBOOK:
+            return "background_task.sync_provider_audiobooks"
+        if media_type == MediaType.PODCAST:
+            return "background_task.sync_provider_podcasts"
+        return "settings.sync"
 
-        task.add_done_callback(on_sync_task_done)
-        return
+    def _get_sync_task_metadata(
+        self, provider: MusicProvider, media_type: MediaType
+    ) -> TaskMetadata:
+        """Return metadata for a provider sync task."""
+        return {
+            "task_domain": "music_sync",
+            "provider_domain": provider.domain,
+            "provider_instance": provider.instance_id,
+            "provider_name": provider.name,
+            "media_type": media_type.value,
+        }
+
+    def _handle_sync_completion_check(self) -> None:
+        """Run follow-up maintenance when no provider sync tasks remain active."""
+        if self.active_sync_tasks:
+            return
+        self.mass.signal_event(EventType.MUSIC_SYNC_COMPLETED)
+        self._queue_database_cleanup_task()
+
+    def _register_database_cleanup_task(self) -> BackgroundTask:
+        """Register the recurring database cleanup background task."""
+        utc_hour, utc_minute = local_clock_time_to_utc(5, 0)
+        desired_schedule = TaskSchedule.daily(hour=utc_hour, minute=utc_minute)
+        return self.mass.tasks.register_scheduled_task(
+            task_id=DATABASE_CLEANUP_TASK_ID,
+            name="Database cleanup",
+            handler=self._cleanup_database,
+            schedule=desired_schedule,
+            translation_key="background_task.database_cleanup",
+            metadata={
+                "task_domain": "music_database_cleanup",
+            },
+            allow_retry=True,
+        )
+
+    def _register_provider_mapping_correction_task(self) -> BackgroundTask:
+        """Register the recurring provider mapping correction background task."""
+        utc_hour, utc_minute = local_clock_time_to_utc(4, 0)
+        desired_schedule = TaskSchedule.daily(every=30, hour=utc_hour, minute=utc_minute)
+        return self.mass.tasks.register_scheduled_task(
+            task_id=PROVIDER_MAPPING_CORRECTION_TASK_ID,
+            name="Correct provider mappings",
+            handler=self.correct_multi_instance_provider_mappings,
+            schedule=desired_schedule,
+            translation_key="background_task.correct_provider_mappings",
+            metadata={
+                "task_domain": "music_provider_mapping_correction",
+            },
+            allow_retry=True,
+        )
+
+    def _queue_database_cleanup_task(self) -> BackgroundTask:
+        """Queue the post-sync database cleanup as a managed background task."""
+        self._register_database_cleanup_task()
+        return self.mass.tasks.run_task(DATABASE_CLEANUP_TASK_ID)
+
+    def queue_provider_mapping_correction_task(self) -> BackgroundTask:
+        """Queue the provider mapping correction as a managed background task."""
+        self._register_provider_mapping_correction_task()
+        return self.mass.tasks.run_task(PROVIDER_MAPPING_CORRECTION_TASK_ID)
 
     def _sort_search_result(
         self,
@@ -1941,45 +2039,28 @@ class MusicController(CoreController):
         self, provider: MusicProvider, media_type: MediaType, is_initial: bool = False
     ) -> None:
         """Schedule Library sync for given provider and media type."""
-        job_key = f"sync_{provider.instance_id}_{media_type.value}"
-        # cancel any existing timers
-        self.mass.cancel_timer(job_key)
         # handle mediatype specific sync config
         conf_key = f"library_sync_{media_type}s"
         sync_conf = await self.mass.config.get_provider_config_value(provider.instance_id, conf_key)
         if not sync_conf:
+            self.mass.tasks.unregister_scheduled_task(self._get_sync_task_id(provider, media_type))
             return
-        conf_key = f"provider_sync_interval_{media_type.value}s"
-        sync_interval = await self.mass.config.get_provider_config_value(
-            provider.instance_id, conf_key, return_type=int
-        )
-        if sync_interval <= 0:
-            # sync disabled for this media type
-            return
-        sync_interval = sync_interval * 60  # config interval is in minutes - convert to seconds
-
-        if is_initial:
-            # schedule the first sync run
-            initial_interval = 10
-            if last_sync := await self.mass.cache.get(
-                key=media_type.value,
-                provider=provider.instance_id,
-                category=CACHE_CATEGORY_LAST_SYNC,
-            ):
-                initial_interval += max(0, sync_interval - (self.mass.loop.time() - last_sync))
-            sync_interval = initial_interval
-
-        self.mass.call_later(
-            sync_interval,
-            self._start_provider_sync,
-            provider,
-            media_type,
-            task_id=job_key,
+        self.mass.tasks.register_scheduled_task(
+            task_id=self._get_sync_task_id(provider, media_type),
+            name=self._get_sync_task_name(provider, media_type),
+            handler=self._create_provider_sync_handler(provider, media_type),
+            schedule=provider.get_default_library_sync_schedule(media_type),
+            initial_delay=10 if is_initial else None,
+            translation_key=self._get_sync_task_translation_key(media_type),
+            translation_args=[provider.name],
+            metadata=self._get_sync_task_metadata(provider, media_type),
+            allow_retry=True,
         )
 
     async def _cleanup_database(self) -> None:
         """Perform database cleanup/maintenance."""
         self.logger.debug("Performing database cleanup...")
+        update_current_task_progress_text("Cleaning old playlog entries")
         # Remove playlog entries older than 90 days
         await self.database.delete_where_query(
             DB_TABLE_PLAYLOG, f"timestamp < strftime('%s','now') - {3600 * 24 * 90}"
@@ -1992,6 +2073,7 @@ class MusicController(CoreController):
             self.playlists,
             self.radio,
         ):
+            update_current_task_progress_text(f"Cleaning {ctrl.media_type.value} library records")
             # Provider mappings where the db item is removed
             query = (
                 f"item_id not in (SELECT item_id from {ctrl.db_table}) "
@@ -2010,6 +2092,7 @@ class MusicController(CoreController):
                 f"AND item_id not in (select item_id from {ctrl.db_table})"
             )
             await self.mass.music.database.delete_where_query(DB_TABLE_PLAYLOG, where_clause)
+        update_current_task_progress_text("Database cleanup finished")
         self.logger.debug("Database cleanup done")
 
     async def _setup_database(self) -> None:
@@ -2054,6 +2137,7 @@ class MusicController(CoreController):
                 await self._database.setup()
                 await self.mass.cache.clear()
                 await self.__create_database_tables()
+                prev_version = 0
 
         # store current schema version
         await self._database.insert_or_replace(
@@ -2063,6 +2147,9 @@ class MusicController(CoreController):
         # create indexes and triggers if needed
         await self.__create_database_indexes()
         await self.__create_database_triggers()
+        if prev_version == 0:
+            # fresh install - populate default genres
+            await self.genres.restore_default_genres()
         # compact db
         self.logger.debug("Compacting database...")
         try:
@@ -2179,7 +2266,7 @@ class MusicController(CoreController):
 
         if prev_version <= 21:
             # drop table for smart fades analysis - it will be recreated with needed columns
-            await self._database.execute(f"DROP TABLE IF EXISTS {DB_TABLE_SMART_FADES_ANALYSIS}")
+            await self._database.execute("DROP TABLE IF EXISTS smart_fades_analysis")
             await self.__create_database_tables()
 
         if prev_version <= 22:
@@ -2479,15 +2566,127 @@ class MusicController(CoreController):
             # Smart fades analyses were previously computed on silence-stripped audio,
             # so beat timestamps are misaligned with the unstripped buffers now passed
             # to the crossfade mixer. Truncate the table so all analyses are re-computed.
-            await self._database.execute(f"DELETE FROM {DB_TABLE_SMART_FADES_ANALYSIS}")
+            with suppress(Exception):
+                await self._database.execute("DELETE FROM smart_fades_analysis")
 
         if prev_version <= 30:
             # add supported_mediatypes column to playlist table, and make {MediaType.TRACK},
             # i.e. ["track"] the default, as this was the only media type supported.
+            try:
+                await self._database.execute(
+                    f"ALTER TABLE {DB_TABLE_PLAYLISTS} ADD COLUMN supported_mediatypes"
+                    " json DEFAULT '[\"track\"]' NOT NULL"
+                )
+            except Exception as err:
+                if "duplicate column" not in str(err):
+                    raise
+
+        if prev_version <= 31:
+            # create the genre_media_item_exclusion table (new in schema 31)
             await self._database.execute(
-                f"ALTER TABLE {DB_TABLE_PLAYLISTS} ADD COLUMN supported_mediatypes"
-                " json DEFAULT '[\"track\"]' NOT NULL"
+                f"""
+                CREATE TABLE IF NOT EXISTS {DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION}(
+                [genre_id] INTEGER NOT NULL,
+                [media_id] INTEGER NOT NULL,
+                [media_type] TEXT NOT NULL,
+                FOREIGN KEY([genre_id]) REFERENCES [genres]([item_id]),
+                UNIQUE(genre_id, media_id, media_type)
+                );"""
             )
+            await self._database.execute(
+                f"CREATE INDEX IF NOT EXISTS {DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION}_media_idx "
+                f"on {DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION}(media_id,media_type);"
+            )
+            await self._database.execute(
+                f"CREATE INDEX IF NOT EXISTS {DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION}_genre_idx "
+                f"on {DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION}(genre_id);"
+            )
+
+        if prev_version <= 32:
+            # recreate genre_media_item_mapping with nullable alias and is_derived column
+            # (new in schema 33 to support propagated genre mappings from tracks)
+            await self._database.execute(
+                f"ALTER TABLE {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
+                f"RENAME TO {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING}_old;"
+            )
+            await self._database.execute(
+                f"""
+                CREATE TABLE {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING}(
+                [genre_id] INTEGER NOT NULL,
+                [media_id] INTEGER NOT NULL,
+                [media_type] TEXT NOT NULL,
+                [alias] TEXT,
+                [is_derived] BOOLEAN NOT NULL DEFAULT 0,
+                FOREIGN KEY([genre_id]) REFERENCES [genres]([item_id]),
+                UNIQUE(genre_id, media_id, media_type)
+                );"""
+            )
+            await self._database.execute(
+                f"INSERT INTO {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
+                f"(genre_id, media_id, media_type, alias) "
+                f"SELECT genre_id, media_id, media_type, alias "
+                f"FROM {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING}_old;"
+            )
+            await self._database.execute(f"DROP TABLE {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING}_old;")
+
+        if prev_version <= 33:
+            # add is_excluded column to genres table (new in schema 34)
+            try:
+                await self._database.execute(
+                    f"ALTER TABLE {DB_TABLE_GENRES} "
+                    "ADD COLUMN [is_excluded] BOOLEAN NOT NULL DEFAULT 0;"
+                )
+            except Exception as err:
+                if "duplicate column" not in str(err):
+                    raise
+            # drop the old genre_global_exclusion table (replaced by is_excluded column)
+            await self._database.execute("DROP TABLE IF EXISTS genre_global_exclusion;")
+            # add is_default column to genres table (new in schema 34)
+            try:
+                await self._database.execute(
+                    f"ALTER TABLE {DB_TABLE_GENRES} "
+                    "ADD COLUMN [is_default] BOOLEAN NOT NULL DEFAULT 0;"
+                )
+            except Exception as err:
+                if "duplicate column" not in str(err):
+                    raise
+            # mark all existing genres with a translation_key as default
+            await self._database.execute(
+                f"UPDATE {DB_TABLE_GENRES} SET is_default = 1 WHERE translation_key IS NOT NULL;"
+            )
+        if prev_version <= 34:
+            # fix filesystem playlists missing in_library flag
+            await self._database.execute(
+                f"UPDATE {DB_TABLE_PROVIDER_MAPPINGS} SET in_library = 1 "
+                "WHERE media_type = 'playlist' "
+                "AND provider_domain IN ('filesystem_local', 'filesystem_smb', 'filesystem_nfs');"
+            )
+
+        if prev_version <= 35:
+            # add is_dynamic column to playlist table
+            try:
+                await self._database.execute(
+                    f"ALTER TABLE {DB_TABLE_PLAYLISTS} ADD COLUMN is_dynamic"
+                    " BOOLEAN NOT NULL DEFAULT 0"
+                )
+            except Exception as err:
+                if "duplicate column" not in str(err):
+                    raise
+            # backfill is_dynamic for existing Apple Music station playlists
+            await self._database.execute(
+                f"UPDATE {DB_TABLE_PLAYLISTS} SET is_dynamic = 1 "
+                f"WHERE item_id IN ("
+                f"  SELECT item_id FROM {DB_TABLE_PROVIDER_MAPPINGS} "
+                f"  WHERE media_type = 'playlist' "
+                f"  AND provider_domain = 'apple_music' "
+                f"  AND provider_item_id LIKE 'ra.%'"
+                f")"
+            )
+
+        if prev_version <= 36:
+            # drop legacy smart_fades_analysis table — analysis is now handled by
+            # audio analysis providers and stored in the audio_analysis table.
+            await self._database.execute("DROP TABLE IF EXISTS smart_fades_analysis")
 
         # save changes
         await self._database.commit()
@@ -2601,7 +2800,8 @@ class MusicController(CoreController):
             [timestamp_modified] INTEGER NOT NULL DEFAULT 0,
             [search_name] TEXT NOT NULL,
             [search_sort_name] TEXT NOT NULL,
-            [supported_mediatypes] json NOT NULL DEFAULT '[\"track\"]'
+            [supported_mediatypes] json NOT NULL DEFAULT '[\"track\"]',
+            [is_dynamic] BOOLEAN NOT NULL DEFAULT 0
             );"""
         )
         await self.database.execute(
@@ -2680,7 +2880,9 @@ class MusicController(CoreController):
             [timestamp_added] INTEGER DEFAULT (cast(strftime('%s','now') as int)),
             [timestamp_modified] INTEGER NOT NULL DEFAULT 0,
             [search_name] TEXT NOT NULL,
-            [search_sort_name] TEXT NOT NULL
+            [search_sort_name] TEXT NOT NULL,
+            [is_excluded] BOOLEAN NOT NULL DEFAULT 0,
+            [is_default] BOOLEAN NOT NULL DEFAULT 0
             );"""
         )
         await self.database.execute(
@@ -2689,7 +2891,18 @@ class MusicController(CoreController):
             [genre_id] INTEGER NOT NULL,
             [media_id] INTEGER NOT NULL,
             [media_type] TEXT NOT NULL,
-            [alias] TEXT NOT NULL,
+            [alias] TEXT,
+            [is_derived] BOOLEAN NOT NULL DEFAULT 0,
+            FOREIGN KEY([genre_id]) REFERENCES [genres]([item_id]),
+            UNIQUE(genre_id, media_id, media_type)
+            );"""
+        )
+        await self.database.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION}(
+            [genre_id] INTEGER NOT NULL,
+            [media_id] INTEGER NOT NULL,
+            [media_type] TEXT NOT NULL,
             FOREIGN KEY([genre_id]) REFERENCES [genres]([item_id]),
             UNIQUE(genre_id, media_id, media_type)
             );"""
@@ -2755,19 +2968,16 @@ class MusicController(CoreController):
         )
 
         await self.database.execute(
-            f"""CREATE TABLE IF NOT EXISTS {DB_TABLE_SMART_FADES_ANALYSIS}(
+            f"""CREATE TABLE IF NOT EXISTS {DB_TABLE_AUDIO_ANALYSIS}(
                     [id] INTEGER PRIMARY KEY AUTOINCREMENT,
+                    [media_type] TEXT NOT NULL,
                     [item_id] TEXT NOT NULL,
                     [provider] TEXT NOT NULL,
-                    [fragment] INTEGER NOT NULL,
-                    [bpm] REAL NOT NULL,
-                    [beats] TEXT NOT NULL,
-                    [downbeats] TEXT NOT NULL,
-                    [confidence] REAL NOT NULL,
-                    [duration] REAL,
+                    [aa_provider_domain] TEXT NOT NULL,
+                    [analysis_data] json NOT NULL,
                     [analysis_version] INTEGER DEFAULT 1,
                     [timestamp_created] INTEGER DEFAULT (cast(strftime('%s','now') as int)),
-                    UNIQUE(item_id,provider,fragment));"""
+                    UNIQUE(item_id,provider,aa_provider_domain,media_type));"""
         )
 
         await self.database.commit()
@@ -2876,11 +3086,6 @@ class MusicController(CoreController):
             f"CREATE INDEX IF NOT EXISTS {DB_TABLE_LOUDNESS_MEASUREMENTS}_idx "
             f"on {DB_TABLE_LOUDNESS_MEASUREMENTS}(media_type,item_id,provider);"
         )
-        # index on smart fades analysis table
-        await self.database.execute(
-            f"CREATE INDEX IF NOT EXISTS {DB_TABLE_SMART_FADES_ANALYSIS}_idx "
-            f"on {DB_TABLE_SMART_FADES_ANALYSIS}(item_id,provider,fragment);"
-        )
         # indexes on genre_media_item_mapping table
         await self.database.execute(
             f"CREATE INDEX IF NOT EXISTS {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING}_media_idx "
@@ -2889,6 +3094,15 @@ class MusicController(CoreController):
         await self.database.execute(
             f"CREATE INDEX IF NOT EXISTS {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING}_genre_alias_idx "
             f"on {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING}(genre_id,alias);"
+        )
+        # indexes on genre_media_item_exclusion table
+        await self.database.execute(
+            f"CREATE INDEX IF NOT EXISTS {DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION}_media_idx "
+            f"on {DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION}(media_id,media_type);"
+        )
+        await self.database.execute(
+            f"CREATE INDEX IF NOT EXISTS {DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION}_genre_idx "
+            f"on {DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION}(genre_id);"
         )
         # unique index on playlog table
         await self.database.execute(
@@ -2948,9 +3162,6 @@ class MusicController(CoreController):
                     await ctrl.update_item_in_library(db_item.item_id, db_item)
                 # prevent overwhelming the event loop
                 await asyncio.sleep(0.2)
-        self.mass.config.set_raw_core_config_value(
-            self.domain, LAST_PROVIDER_INSTANCE_SCAN, int(time.time())
-        )
         self.logger.debug("Provider mappings correction done")
 
     async def _get_user_for_provider(

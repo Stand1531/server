@@ -73,6 +73,21 @@ if TYPE_CHECKING:
     from .provider import MusicCastProvider
 
 
+def get_player_option_translation_key(mc_key: str) -> str:
+    """Get translation key for player option.
+
+    MC key has format like 'zone_ENHANCER' or 'zone_TONE_CONTROL_bass'
+    """
+    mc_key = mc_key.lower().replace("zone_", "")
+    if mc_key == "tone_control_bass":
+        return "bass"
+    if mc_key == "tone_control_treble":
+        return "treble"
+    if mc_key == "surr_decoder_type":
+        return "surround_decoder_type"
+    return mc_key
+
+
 @dataclass
 class MusicCastMacAddresses(DataClassDictMixin):
     """MusicCastMacAddresses.
@@ -132,6 +147,7 @@ class MusicCastPlayer(Player):
     async def setup(self) -> None:
         """Set up player in Music Assistant."""
         await self.set_static_attributes()
+        await self.set_dynamic_attributes(update_state=False)
 
     async def set_static_attributes(self) -> None:
         """Set static properties."""
@@ -221,7 +237,7 @@ class MusicCastPlayer(Player):
                 PlayerSoundMode(id=source_id, name=friendly_name, passive=False)
             )
 
-    async def set_dynamic_attributes(self) -> None:
+    async def set_dynamic_attributes(self, update_state: bool = True) -> None:
         """Update Player attributes."""
         # ruff: noqa: PLR0915
         self._attr_available = True
@@ -401,6 +417,7 @@ class MusicCastPlayer(Player):
                 self._attr_options.append(
                     PlayerOption(
                         key=capability.id,
+                        translation_key=get_player_option_translation_key(capability.id),
                         name=capability.name,
                         type=PlayerOptionType.BOOLEAN,
                         read_only=True,
@@ -411,6 +428,7 @@ class MusicCastPlayer(Player):
                 self._attr_options.append(
                     PlayerOption(
                         key=capability.id,
+                        translation_key=get_player_option_translation_key(capability.id),
                         name=capability.name,
                         type=PlayerOptionType.BOOLEAN,
                         value=capability.current,
@@ -421,6 +439,7 @@ class MusicCastPlayer(Player):
                 self._attr_options.append(
                     PlayerOption(
                         key=capability.id,
+                        translation_key=get_player_option_translation_key(capability.id),
                         name=capability.name,
                         type=PlayerOptionType.INTEGER,
                         value=capability.current,
@@ -431,6 +450,7 @@ class MusicCastPlayer(Player):
                 self._attr_options.append(
                     PlayerOption(
                         key=capability.id,
+                        translation_key=get_player_option_translation_key(capability.id),
                         name=capability.name,
                         type=PlayerOptionType.INTEGER,
                         value=capability.current,
@@ -444,6 +464,7 @@ class MusicCastPlayer(Player):
                 self._attr_options.append(
                     PlayerOption(
                         key=capability.id,
+                        translation_key=get_player_option_translation_key(capability.id),
                         name=capability.name,
                         type=PlayerOptionType.STRING,
                         value=capability.current,
@@ -464,6 +485,7 @@ class MusicCastPlayer(Player):
                 self._attr_options.append(
                     PlayerOption(
                         key=capability.id,
+                        translation_key=get_player_option_translation_key(capability.id),
                         name=capability.name,
                         type=PlayerOptionType.STRING,
                         value=str(capability.current),
@@ -472,7 +494,8 @@ class MusicCastPlayer(Player):
                     )
                 )
 
-        self.update_state()
+        if update_state:
+            self.update_state()
 
     @property
     def synced_to(self) -> str | None:
