@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 
 import plexapi.exceptions
 import requests
-import urllib3.exceptions
+
 from music_assistant_models.config_entries import (
     ConfigEntry,
     ConfigValueOption,
@@ -114,6 +114,9 @@ SUPPORTED_FEATURES = {
     ProviderFeature.RECOMMENDATIONS,
 }
 
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 def resolve_plex_server(
     local_server_ip: str,
     local_server_port: int,
@@ -144,7 +147,8 @@ def resolve_plex_server(
     base_url = f"{local_server_protocol}://{local_server_ip}:{local_server_port}"
 
     session = requests.Session()
-    session.verify = local_server_verify_cert
+    # Disable SSL verification for LAN Plex
+    session.verify = False
     session.headers.update(
         {
             "X-Plex-Client-Identifier": client_id,
@@ -202,18 +206,10 @@ def resolve_plex_server(
             raise LoginFailed(f"Server {local_server_ip}:{local_server_port} not accessible in your Plex account") from err
 
 
-    # silence urllib3 InsecureRequestWarning from Plex connections
-    # using wildcard certificates that don't validate against LAN IPs
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            category=urllib3.exceptions.InsecureRequestWarning,
-        )
-
-        # Local-only path
-        if auth_token == AUTH_TOKEN_UNAUTH:
-            # Local connection
-            plex_server = PlexServer(base_url, session=session)
+    # Local-only path
+    if auth_token == AUTH_TOKEN_UNAUTH:
+        # Local connection
+        plex_server = PlexServer(base_url, session=session)
 
     if plex_server is None:
         raise LoginFailed(f"Plex server {local_server_ip}:{local_server_port} not found")
