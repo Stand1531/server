@@ -22,7 +22,8 @@ def _load_pyproject() -> dict:
 
 
 def gather_uv_index_config(data: dict) -> tuple[list[str], dict[str, str]]:
-    """Read [tool.uv.index] and [tool.uv.sources] from pyproject.toml.
+    """
+    Read [tool.uv.index] and [tool.uv.sources] from pyproject.toml.
 
     :return: Tuple of (extra_index_urls, package_variant_suffixes).
         extra_index_urls: URLs to emit as --extra-index-url.
@@ -67,7 +68,7 @@ def gather_requirements_from_manifests() -> list[str]:
     """Gather all of the requirements from provider manifests."""
     dependencies: list[str] = []
     providers_path = "music_assistant/providers"
-    for dir_str in os.listdir(providers_path):  # noqa: PTH208, RUF100
+    for dir_str in sorted(os.listdir(providers_path)):  # noqa: PTH208, RUF100
         dir_path = os.path.join(providers_path, dir_str)
         if not os.path.isdir(dir_path):
             continue

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -16,6 +15,7 @@ from music_assistant_models.enums import MediaType
 from torchaudio.transforms import SpectralCentroid
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
+from music_assistant.helpers.util import is_arm
 from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.models.audio_analysis_provider import AudioAnalysisProvider
 
@@ -73,6 +73,8 @@ class SmartFadesProvider(AudioAnalysisProvider):
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
+        # Configure the inference runtime before loading any model (see the controller method).
+        self.mass.streams.audio_analysis.ensure_inference_runtime_configured()
         (
             self._beat_this_model,
             self._beat_this_post_processor,
@@ -82,13 +84,55 @@ class SmartFadesProvider(AudioAnalysisProvider):
             self._spectral_centroid,
         ) = await asyncio.to_thread(self._initialize_models)
 
+    async def process_pcm_chunk(
+        self,
+        session_id: str,
+        pcm_chunk: bytes,
+    ) -> None:
+        """Process a PCM chunk for beat tracking."""
+        data = self._data.get(session_id)
+        if not data:
+            return
+
+        pcm_mono = await self._run_offloaded(
+            decode_pcm_chunk_to_mono, data.input_audio_format, pcm_chunk
+        )
+        if pcm_mono.size == 0:
+            return
+
+        # Per-chunk VQT for key detection (skip short tail chunks)
+        if len(pcm_mono) >= data.input_audio_format.sample_rate:
+            await self._run_offloaded(
+                self._compute_musical_key_features,
+                pcm_mono,
+                data.input_audio_format.sample_rate,
+                data,
+            )
+
+        data.pcm_buffer.append(pcm_mono)
+        data.pcm_samples += len(pcm_mono)
+
+        # calculate features in 10s blocks to avoid cpu contention
+        if data.pcm_samples >= data.block_samples:
+            await self._process_block(data)
+
+    async def cancel(self, session_id: str) -> None:
+        """Cancel a beat tracking session."""
+        data = self._data.pop(session_id, None)
+        if data:
+            data.pcm_buffer.clear()
+            data.beats_feature_blocks.clear()
+            data.musical_key_feature_blocks.clear()
+            data.features.reset()
+        await super().cancel(session_id)
+
     def _initialize_models(self) -> tuple[Any, ...]:
         """Initialize ML models (runs in a thread to avoid blocking the event loop)."""
-        torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
         beat_this_model = Spect2Frames(checkpoint_path="small0", device=self._device)
-        # Select best available quantization engine (fbgemm is x86-only, qnnpack for ARM)
+        # torch aarch64 wheels advertise fbgemm in supported_engines but its kernels are x86-only.
+        preference = ("qnnpack", "fbgemm") if is_arm() else ("fbgemm", "qnnpack")
         supported_engines = torch.backends.quantized.supported_engines
-        quantized_engine = next((e for e in ("fbgemm", "qnnpack") if e in supported_engines), None)
+        quantized_engine = next((e for e in preference if e in supported_engines), None)
         if quantized_engine is not None and torch.backends.quantized.engine != quantized_engine:
             torch.backends.quantized.engine = quantized_engine
         beat_this_model.model = torch.ao.quantization.quantize_dynamic(  # type: ignore[no-untyped-call]
@@ -107,51 +151,6 @@ class SmartFadesProvider(AudioAnalysisProvider):
             skey_crop,
             spectral_centroid,
         )
-
-    async def process_pcm_chunk(
-        self,
-        session_id: str,
-        pcm_chunk: bytes,
-    ) -> None:
-        """Process a PCM chunk for beat tracking."""
-        data = self._data.get(session_id)
-        if not data:
-            return
-
-        pcm_mono = await asyncio.to_thread(
-            decode_pcm_chunk_to_mono, data.input_audio_format, pcm_chunk
-        )
-        if pcm_mono.size == 0:
-            return
-
-        # Per-chunk VQT for key detection (skip short tail chunks)
-        if len(pcm_mono) >= data.input_audio_format.sample_rate:
-            await asyncio.to_thread(
-                self._compute_musical_key_features,
-                pcm_mono,
-                data.input_audio_format.sample_rate,
-                data,
-            )
-
-        data.pcm_buffer.append(pcm_mono)
-        data.pcm_samples += len(pcm_mono)
-
-        # calculate features in 10s blocks to avoid cpu contention
-        if data.pcm_samples >= data.block_samples:
-            await self._process_block(data)
-
-    async def cancel(self, session_id: str) -> None:
-        """Cancel a beat tracking session.
-
-        :param session_id: The analysis session ID.
-        """
-        data = self._data.pop(session_id, None)
-        if data:
-            data.pcm_buffer.clear()
-            data.beats_feature_blocks.clear()
-            data.musical_key_feature_blocks.clear()
-            data.features.reset()
-        await super().cancel(session_id)
 
     async def _start_analysis(
         self,
@@ -175,6 +174,7 @@ class SmartFadesProvider(AudioAnalysisProvider):
             features=AdvancedBeatFeatureExtractor(
                 sample_rate=ANALYSIS_SAMPLE_RATE,
                 device=self._device,
+                offload=self._run_offloaded,
             ),
             resampler=soxr.ResampleStream(
                 in_rate=audio_format.sample_rate,
@@ -188,11 +188,11 @@ class SmartFadesProvider(AudioAnalysisProvider):
         self.logger.debug("Started beat tracking session %s", session_id)
         return True
 
-    async def _finalize(self, session_id: str) -> None:
+    async def _finalize(self, session_id: str) -> AudioAnalysisData | None:
         """Finalize beat tracking and store results."""
         data = self._data.pop(session_id, None)
         if not data:
-            return
+            return None
 
         # Flush remaining buffered PCM
         if data.pcm_samples:
@@ -204,7 +204,7 @@ class SmartFadesProvider(AudioAnalysisProvider):
             data.beats_feature_blocks.append(final_feats)
 
         if not data.beats_feature_blocks:
-            return
+            return None
 
         feats = np.concatenate(data.beats_feature_blocks, axis=0)
         duration = data.total_pcm_samples / ANALYSIS_SAMPLE_RATE
@@ -215,14 +215,12 @@ class SmartFadesProvider(AudioAnalysisProvider):
             all_vqt = torch.cat(data.musical_key_feature_blocks, dim=-1)  # (1, 1, 84, T_total)
             data.musical_key_feature_blocks.clear()
 
-        # Run beat and key inference concurrently in separate threads
-        beat_task = asyncio.to_thread(self._infer_beat_timings, feats)
-        key_task = asyncio.to_thread(self._infer_musical_key, all_vqt)
-        (beats, downbeats), (key, mode) = await asyncio.gather(beat_task, key_task)
-
+        # Run beat and key inference sequentially to keep peak CPU bounded.
+        beats, downbeats = await self._run_offloaded(self._infer_beat_timings, feats)
         if len(beats) < 2:
             self.logger.debug("Not enough beats detected, skipping storage")
-            return
+            return None
+        key, mode = await self._run_offloaded(self._infer_musical_key, all_vqt)
 
         bpm = calculate_overall_bpm(beats)
 
@@ -260,58 +258,45 @@ class SmartFadesProvider(AudioAnalysisProvider):
             mode=mode,
         )
 
-        await self.mass.streams.audio_analysis.set_audio_analysis(
-            data.item_id,
-            data.provider,
-            self.domain,
-            analysis,
-            analysis_version=self.analysis_version,
-            media_type=MediaType.TRACK,
-        )
-
         self.logger.debug(
-            "Stored beat analysis for %s: BPM=%.1f, %d beats, %d downbeats, key=%s",
+            "Beat analysis for %s: BPM=%.1f, %d beats, %d downbeats, key=%s",
             data.item_id,
             bpm,
             len(beats),
             len(downbeats),
             f"{key} {mode}" if key else "unknown",
         )
+        return analysis
 
     async def _process_block(self, data: SmartFadesData, *, last: bool = False) -> None:
         """Resample accumulated PCM buffer and extract features."""
+        start_time = time.perf_counter()
         pcm_raw = np.concatenate(data.pcm_buffer)
         data.pcm_buffer.clear()
         data.pcm_samples = 0
 
         if data.resampler is not None:
-            pcm_22k = await asyncio.to_thread(data.resampler.resample_chunk, pcm_raw, last)
+            pcm_22k = await self._run_offloaded(data.resampler.resample_chunk, pcm_raw, last)
         else:
             pcm_22k = pcm_raw
 
         data.total_pcm_samples += len(pcm_22k)
 
-        start_time = time.perf_counter()
         feats, _ = await asyncio.gather(
             data.features.process_pcm(pcm_22k),
-            asyncio.to_thread(self._compute_energy_and_spectral_centroids, pcm_22k, data),
+            self._run_offloaded(self._compute_energy_and_spectral_centroids, pcm_22k, data),
         )
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
 
         if feats.size:
             data.beats_feature_blocks.append(feats)
 
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
         self.logger.log(VERBOSE_LOG_LEVEL, "Processed 10s of PCM chunks in %.1fms", elapsed_ms)
 
     def _compute_energy_and_spectral_centroids(
         self, pcm_22k: np.ndarray, data: SmartFadesData
     ) -> None:
-        """Compute fine-resolution RMS energy and spectral centroid for a block.
-
-        RMS is computed in 100ms windows (~2205 samples at 22050 Hz).
-        Spectral centroid is computed per hop frame (~43 frames/s).
-        Both are interpolated to the fixed 1800-bin output representation in _finalize.
-        """
+        """Compute fine-resolution RMS energy and spectral centroid for a block."""
         sr = ANALYSIS_SAMPLE_RATE
         # RMS energy in 100ms windows, including partial final window
         window_samples = sr // 10  # 2205 samples = 100ms
@@ -329,10 +314,12 @@ class SmartFadesProvider(AudioAnalysisProvider):
                 data.energy_chunks.append(np.concatenate(rms_list).astype(np.float32))
 
         # Spectral centroid: keep per-frame (hop_length=512, ~43 frames/s)
-        pcm_tensor = torch.from_numpy(pcm_22k)
-        centroid_frames = self._spectral_centroid(pcm_tensor.unsqueeze(0)).squeeze(0).numpy()
-        if len(centroid_frames) > 0:
-            data.centroid_chunks.append(centroid_frames.astype(np.float32))
+        # Skip short tail buffers: STFT reflect-pad requires len > n_fft // 2.
+        if len(pcm_22k) >= self._spectral_centroid.n_fft:
+            pcm_tensor = torch.from_numpy(pcm_22k)
+            centroid_frames = self._spectral_centroid(pcm_tensor.unsqueeze(0)).squeeze(0).numpy()
+            if len(centroid_frames) > 0:
+                data.centroid_chunks.append(centroid_frames.astype(np.float32))
 
     def _compute_musical_key_features(
         self, pcm_mono: np.ndarray, sample_rate: int, data: SmartFadesData

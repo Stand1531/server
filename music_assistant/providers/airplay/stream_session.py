@@ -35,7 +35,8 @@ class AirPlayStreamSession:
         sync_clients: list[AirPlayPlayer],
         pcm_format: AudioFormat,
     ) -> None:
-        """Initialize AirPlayStreamSession.
+        """
+        Initialize AirPlayStreamSession.
 
         :param airplay_provider: The AirPlay provider instance.
         :param sync_clients: List of AirPlay players to stream to.
@@ -60,7 +61,7 @@ class AirPlayStreamSession:
         self._pcm_buffer = bytearray()
         self._pcm_buffer_max = pcm_format.pcm_sample_size * 5  # 5 seconds
 
-    async def start(self, audio_source: AsyncGenerator[bytes, None]) -> None:
+    async def start(self, audio_source: AsyncGenerator[bytes]) -> None:
         """Initialize stream session for all players."""
         cur_time = time.time()
         wait_start = max(p.wait_start for p in self.sync_clients)
@@ -86,29 +87,39 @@ class AirPlayStreamSession:
             with suppress(asyncio.CancelledError):
                 await self._audio_source_task
         await asyncio.gather(
-            *[self.remove_client(x) for x in self.sync_clients],
+            *[self.remove_client(x, reason="session stop") for x in self.sync_clients],
         )
 
-    async def remove_client(self, airplay_player: AirPlayPlayer) -> None:
-        """Remove a sync client from the session."""
+    async def remove_client(
+        self, airplay_player: AirPlayPlayer, reason: str = "client removed"
+    ) -> None:
+        """
+        Remove a sync client from the session.
+
+        :param airplay_player: The player to remove from the session.
+        :param reason: Short human-readable reason for the removal, used in teardown logs.
+        """
         async with self._lock:
             if airplay_player not in self.sync_clients:
                 return
             self.sync_clients.remove(airplay_player)
-        await self.stop_client(airplay_player)
-        airplay_player.set_state_from_stream(PlaybackState.IDLE)
-        # If this was the last client, stop the session
-        if not self.sync_clients:
-            await self.stop()
-            return
+        await self._cleanup_after_removal(airplay_player, reason=reason)
 
-    async def stop_client(self, airplay_player: AirPlayPlayer) -> None:
+    async def stop_client(
+        self, airplay_player: AirPlayPlayer, reason: str = "stop_client called"
+    ) -> None:
         """
         Stop a client's stream and ffmpeg.
 
         :param airplay_player: The player to stop.
-        :param force: If True, kill CLI process immediately.
+        :param reason: Short human-readable reason for the teardown, used in debug logs.
         """
+        self.prov.logger.debug(
+            "AirPlay session teardown: session=%s client=%s reason=%s",
+            id(self),
+            airplay_player.player_id,
+            reason,
+        )
         ffmpeg = self._player_ffmpeg.pop(airplay_player.player_id, None)
         # note that we use kill instead of graceful close here,
         # because otherwise it can take a very long time for the process to exit.
@@ -118,7 +129,8 @@ class AirPlayStreamSession:
             await airplay_player.stream.stop(force=True)
 
     async def add_client(self, airplay_player: AirPlayPlayer) -> None:
-        """Add a sync client to the session as a late joiner.
+        """
+        Add a sync client to the session as a late joiner.
 
         Uses the PCM ring buffer to prime the late joiner's pipeline so it
         starts playing quickly. All work happens under the lock to ensure
@@ -218,7 +230,7 @@ class AirPlayStreamSession:
                     airplay_player.player_id,
                     err,
                 )
-                await self.stop_client(airplay_player)
+                await self.stop_client(airplay_player, reason="late joiner start/prime failed")
                 return
 
             # Now add to sync_clients — the audio streamer's next chunk
@@ -241,9 +253,32 @@ class AirPlayStreamSession:
                     airplay_player.player_id,
                     time.time() - now,
                 )
-                self.mass.create_task(self.remove_client(airplay_player))
+                await self.remove_client(airplay_player, reason="late joiner connection timeout")
 
-    async def _audio_streamer(self, audio_source: AsyncGenerator[bytes, None]) -> None:
+    async def _cleanup_after_removal(
+        self, airplay_player: AirPlayPlayer, reason: str = "client removed"
+    ) -> None:
+        """
+        Clean up processes and state after a client has been removed from sync_clients.
+
+        :param airplay_player: The player whose processes should be stopped.
+        :param reason: Short human-readable reason, forwarded to stop_client for logging.
+        """
+        stream = airplay_player.stream
+        if stream is not None and stream.session != self:
+            stream = None
+        await self.stop_client(airplay_player, reason=reason)
+        # Only set IDLE if the player's stream still belongs to this session,
+        # otherwise a re-add to a new session may have already set a new state.
+        if stream is not None:
+            airplay_player.set_state_from_stream(PlaybackState.IDLE, stream=stream)
+        # Re-check sync_clients under the lock to avoid racing with add_client.
+        async with self._lock:
+            should_stop = not self.sync_clients
+        if should_stop:
+            await self.stop()
+
+    async def _audio_streamer(self, audio_source: AsyncGenerator[bytes]) -> None:
         """Stream audio to all players."""
         stream_error: BaseException | None = None
         try:
@@ -282,7 +317,8 @@ class AirPlayStreamSession:
             )
 
     async def _write_chunk_to_all_players(self, chunk: bytes) -> bool:
-        """Write a chunk to all connected players.
+        """
+        Write a chunk to all connected players.
 
         :return: True if there are still running clients, False otherwise.
         """
@@ -304,7 +340,7 @@ class AirPlayStreamSession:
             results = await asyncio.gather(*write_tasks, return_exceptions=True)
 
             # Check for write errors or timeouts
-            players_to_remove: list[AirPlayPlayer] = []
+            players_to_remove: list[tuple[AirPlayPlayer, str]] = []
             for i, result in enumerate(results):
                 if i >= len(sync_clients):
                     continue
@@ -315,19 +351,25 @@ class AirPlayStreamSession:
                         "Removing player %s from session: stopped reading data (write timeout)",
                         player.player_id,
                     )
-                    players_to_remove.append(player)
+                    players_to_remove.append((player, "audio write timeout"))
                 elif isinstance(result, Exception):
                     self.prov.logger.warning(
                         "Removing player %s from session due to write error: %s",
                         player.player_id,
                         result,
                     )
-                    players_to_remove.append(player)
+                    players_to_remove.append((player, f"audio write error: {result}"))
 
-            for player in players_to_remove:
-                self.mass.create_task(self.remove_client(player))
+            # Remove failed players from sync_clients immediately under the lock
+            # so they are excluded from future write cycles. Only defer process
+            # cleanup (_cleanup_after_removal) — this prevents fire-and-forget
+            # remove_client calls from racing with a subsequent add_client when
+            # a player is being moved between groups.
+            for player, removal_reason in players_to_remove:
+                if player in self.sync_clients:
+                    self.sync_clients.remove(player)
+                self.mass.create_task(self._cleanup_after_removal(player, reason=removal_reason))
 
-            # Return False if all clients were removed (or scheduled for removal)
             remaining_clients = len(sync_clients) - len(players_to_remove)
             return remaining_clients > 0
 

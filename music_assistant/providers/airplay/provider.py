@@ -51,11 +51,6 @@ class AirPlayProvider(PlayerProvider):
         """Return the Sendspin bridge manager."""
         return self._bridge_manager
 
-    @property
-    def supports_dynamic_leader_switching(self) -> bool:
-        """Return True: AirPlay supports removing the leader without stream teardown."""
-        return True
-
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         # Initialize Sendspin bridge manager for protocol linking
@@ -134,6 +129,14 @@ class AirPlayProvider(PlayerProvider):
         # shutdown DACP zeroconf service
         if self._dacp_info:
             await self.mass.discovery.aiozc.async_unregister_service(self._dacp_info)
+
+    def get_players(self) -> list[AirPlayPlayer]:
+        """Return all airplay players belonging to this instance."""
+        return cast("list[AirPlayPlayer]", self.players)
+
+    def get_player(self, player_id: str) -> AirPlayPlayer | None:
+        """Return AirplayPlayer by id."""
+        return cast("AirPlayPlayer | None", self.mass.players.get_player(player_id))
 
     async def _setup_player(
         self, player_id: str, display_name: str, discovery_info: AsyncServiceInfo
@@ -369,6 +372,15 @@ class AirPlayProvider(PlayerProvider):
                     # Already handling a prevent-playback for this stream
                     # (duplicate message while ungroup/stop is still in progress)
                     self.logger.debug("Ignoring duplicate prevent-playback for %s", player.name)
+                elif not player.stream.connected:
+                    # Some devices (e.g. Denon AVR-X2700H) emit a transient
+                    # prevent-playback=1/=0 pair during RAOP session setup.
+                    # A real "device switched off / source switched" event only happens
+                    # once the stream is actually established, so ignore these.
+                    self.logger.debug(
+                        "Ignoring prevent-playback for %s - stream not yet established",
+                        player.name,
+                    )
                 else:
                     player.stream.prevent_playback = True
                     if player.stream.session:
@@ -411,11 +423,3 @@ class AirPlayProvider(PlayerProvider):
             writer.close()
             with suppress(Exception):
                 await writer.wait_closed()
-
-    def get_players(self) -> list[AirPlayPlayer]:
-        """Return all airplay players belonging to this instance."""
-        return cast("list[AirPlayPlayer]", self.players)
-
-    def get_player(self, player_id: str) -> AirPlayPlayer | None:
-        """Return AirplayPlayer by id."""
-        return cast("AirPlayPlayer | None", self.mass.players.get_player(player_id))

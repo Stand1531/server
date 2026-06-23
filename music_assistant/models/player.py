@@ -19,6 +19,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast, final
 
+from music_assistant_models.config_entries import MULTI_VALUE_SPLITTER
 from music_assistant_models.constants import (
     EXTRA_ATTRIBUTES_TYPES,
     PLAYER_CONTROL_FAKE,
@@ -54,6 +55,7 @@ from music_assistant.constants import (
     CONF_PLAYERS,
     CONF_POWER_CONTROL,
     CONF_PREFERRED_OUTPUT_PROTOCOL,
+    CONF_SAMPLE_RATES,
     CONF_VOLUME_CONTROL,
     EXTERNAL_SOURCES,
     PLAYER_CONTROL_PROTOCOL,
@@ -64,6 +66,7 @@ from music_assistant.helpers.util import get_changed_dataclass_values
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigEntry, ConfigValueType, PlayerConfig
+    from music_assistant_models.media_items import MediaItemPalette
     from music_assistant_models.player_queue import PlayerQueue
 
     from .player_provider import PlayerProvider
@@ -96,12 +99,18 @@ class Player(ABC):
     _attr_active_source: str | None = None
     _attr_active_sound_mode: str | None = None
     _attr_current_media: PlayerMedia | None = None
+    # Palette for the image currently shown, resolved asynchronously from the
+    # cache controller and carried here so the (synchronous) state serialization
+    # can read it back without blocking. See set_resolved_palette.
+    _attr_current_palette: MediaItemPalette | None = None
+    _attr_current_palette_url: str | None = None
     _attr_needs_poll: bool = False
     _attr_poll_interval: int = 30
     _attr_hidden_by_default: bool = False
     _attr_expose_to_ha_by_default: bool = True
     _attr_enabled_by_default: bool = True
     _attr_needs_setup: bool = False
+    _attr_supported_sample_rates: list[tuple[int, int]] | None = None
 
     def __init__(self, provider: PlayerProvider, player_id: str) -> None:
         """Initialize the Player."""
@@ -315,6 +324,19 @@ class Player(ABC):
         return self._attr_can_group_with
 
     @property
+    def is_active_session(self) -> bool:
+        """
+        Return whether this group player is currently holding (capturing) its members.
+
+        Used by :meth:`__final_active_group` to decide whether children should be
+        considered "owned" by this group at this moment. Non-group players should
+        always return ``False``. Group implementations should return ``True`` while
+        a session is being formed, while it is actively playing/paused, and during
+        any idle grace period; and ``False`` once the group is fully dormant.
+        """
+        return False
+
+    @property
     def synced_to(self) -> str | None:
         """Return the id of the player this player is synced to (sync leader)."""
         # default implementation, feel free to override if your
@@ -356,6 +378,23 @@ class Player(ABC):
     def options(self) -> UniqueList[PlayerOption]:
         """Return all PlayerOptions for Player."""
         return UniqueList(self._attr_options)
+
+    @property
+    def supported_sample_rates(self) -> list[tuple[int, int]] | None:
+        """
+        Return the (sample_rate, bit_depth) pairs this player natively supports.
+
+        Example: [(44100, 16), (48000, 24)]
+
+        Players with a known static set should set ``_attr_supported_sample_rates``.
+        Players whose supported rates depend on runtime state (e.g. group players
+        whose members can change) should override this property.
+
+        Returning ``None`` defers to the user's per-player ``CONF_SAMPLE_RATES``
+        selection — callers should use ``get_supported_sample_rates()`` to get a
+        resolved, non-None list.
+        """
+        return self._attr_supported_sample_rates
 
     async def power(self, powered: bool) -> None:
         """
@@ -664,6 +703,46 @@ class Player(ABC):
         # current media is updated (after applying group/sync membership logic).
         # for instance to update any display information on the physical player.
 
+    def on_protocol_player_updated(
+        self, protocol_player: Player, changed_values: dict[str, tuple[Any, Any]]
+    ) -> None:
+        """Handle callback when one of the linked protocol players of the player is updated."""
+        # optional callback
+        # default implementation will simply trigger an update for the state of the player
+        self.mass.players.trigger_player_update(self.player_id)
+
+    def on_protocol_parent_updated(
+        self, protocol_parent: Player, changed_values: dict[str, tuple[Any, Any]]
+    ) -> None:
+        """Handle callback when the parent protocol player of the player is updated."""
+        # optional callback
+        # default implementation will simply trigger an update for the state of the player
+        self.mass.players.trigger_player_update(self.player_id)
+
+    def on_group_member_updated(
+        self, member_player: Player, changed_values: dict[str, tuple[Any, Any]]
+    ) -> None:
+        """Handle callback when a group member of the group player is updated."""
+        # optional callback
+        # default implementation will simply trigger an update for the state of the player
+        self.mass.players.trigger_player_update(self.player_id)
+
+    def on_group_updated(
+        self, group_player: Player, changed_values: dict[str, tuple[Any, Any]]
+    ) -> None:
+        """Handle callback when a group player is updated this player is a member of."""
+        # optional callback
+        # default implementation will simply trigger an update for the state of the player
+        self.mass.players.trigger_player_update(self.player_id)
+
+    def on_sync_parent_updated(
+        self, sync_parent: Player, changed_values: dict[str, tuple[Any, Any]]
+    ) -> None:
+        """Handle callback when the sync parent of this player is updated."""
+        # optional callback
+        # default implementation will simply trigger an update for the state of the player
+        self.mass.players.trigger_player_update(self.player_id)
+
     # DO NOT OVERWRITE BELOW !
     # These properties and methods are either managed by core logic or they
     # are used to perform a very specific function. Overwriting these may
@@ -686,6 +765,12 @@ class Player(ABC):
     def provider_id(self) -> str:
         """Return the provider (instance) id of the player."""
         return self._provider.instance_id
+
+    @property
+    @final
+    def translation_owner(self) -> str:
+        """Return the translation owner namespace ("provider.<domain>") of the player's provider."""
+        return self._provider.translation_owner
 
     @property
     @final
@@ -732,6 +817,46 @@ class Player(ABC):
         """Return if the player is enabled."""
         return self._config.enabled
 
+    @final
+    def get_supported_sample_rates(self) -> list[tuple[int, int]]:
+        """
+        Return the resolved (sample_rate, bit_depth) pairs the player can play.
+
+        Honors, in order:
+        1. The ``supported_sample_rates`` property (declarative or overridden)
+        2. The user's ``CONF_SAMPLE_RATES`` selection
+        3. A safe ``[(44100, 16)]`` fallback
+        """
+        if (declared := self.supported_sample_rates) is not None:
+            return declared
+        config_rates: list[tuple[int, int]] = []
+        if conf := self.config.get_value(CONF_SAMPLE_RATES):
+            conf = cast("list[str]", conf)
+            for item in conf:
+                # tolerate legacy/malformed entries: anything that does not parse as
+                # `<rate><splitter><bit_depth>` is skipped and we fall back to defaults
+                try:
+                    sample_rate_str, bit_depth_str = item.split(MULTI_VALUE_SPLITTER, 1)
+                    config_rates.append((int(sample_rate_str.strip()), int(bit_depth_str.strip())))
+                except ValueError, TypeError:
+                    self.logger.warning(
+                        "Ignoring malformed CONF_SAMPLE_RATES entry %r for player %s",
+                        item,
+                        self.player_id,
+                    )
+        return config_rates or [(44100, 16)]
+
+    @property
+    @final
+    def declares_supported_sample_rates(self) -> bool:
+        """
+        Return True when this player exposes its supported rates without user config.
+
+        Used by the config controller to decide whether to inject the generic
+        ``CONF_ENTRY_SAMPLE_RATES`` option in the player config UI.
+        """
+        return self.supported_sample_rates is not None
+
     @property
     @final
     def initialized(self) -> asyncio.Event:
@@ -763,7 +888,11 @@ class Player(ABC):
         """Return the power control type."""
         conf = self.mass.config.get_raw_player_config_value(self.player_id, CONF_POWER_CONTROL)
         if conf and conf in (PLAYER_CONTROL_NATIVE, PLAYER_CONTROL_FAKE, PLAYER_CONTROL_NONE):
-            # the control type is explicitly set in the config, use that
+            # validate that NATIVE is still backed by an actual POWER feature.
+            # this handles graceful degradation for players (e.g. group players)
+            # that previously advertised POWER but no longer do.
+            if conf == PLAYER_CONTROL_NATIVE and PlayerFeature.POWER not in self.supported_features:
+                return PLAYER_CONTROL_NONE
             return str(conf)
         if conf and (_control := self.mass.players.get_player_control(str(conf))):
             # the control type is explicitly set to a player control,
@@ -952,74 +1081,6 @@ class Player(ABC):
         """
         return self._check_feature_with_active_protocol(PlayerFeature.GAPLESS_PLAYBACK)
 
-    async def handoff_sync_leadership(
-        self,
-        new_leader: Player,
-        remaining_members: list[str] | None = None,
-    ) -> None:
-        """
-        Hand off sync leadership of the live session from this player to ``new_leader``.
-
-        Call on the current sync leader when it should step down and leave the
-        remaining group members playing uninterrupted on a new leader — for
-        example when the current leader is removed from a sync group while
-        playback is active and another member should take over.
-
-        The handoff is two atomic halves:
-          1. Remove this player from the live sync session on the player that
-             owns it (the active output protocol player if a non-native
-             protocol is in use, otherwise this native player itself). The
-             removal intentionally bypasses ``cmd_set_members`` on the
-             controller, which would otherwise interpret self-removal as
-             "dissolve the entire group".
-          2. Attach ``remaining_members`` to ``new_leader`` via the normal
-             controller path so protocol linking/grouping runs correctly on
-             the new leader.
-
-        Only safe to call when the provider of the current leader's active
-        session target has :attr:`PlayerProvider.supports_dynamic_leader_switching`
-        set to True; otherwise the entire sync session must be torn down and
-        re-formed with the new leader.
-
-        The ``new_leader`` must already be part of the live sync session (i.e.
-        its resolved protocol player must be a ``sync_client`` of the current
-        session). If it's a freshly-added player with no existing stream, this
-        method's ``cmd_set_members`` call will be a no-op at the protocol level
-        and the old session remains orphaned. The caller (typically
-        ``SyncGroupPlayer._dynamic_leader_switch``) should verify this
-        precondition before calling.
-
-        :param new_leader: The player that should take over as sync leader.
-            Must already be a sync_client of the current session.
-        :param remaining_members: Parent player ids (excluding ``new_leader``)
-            that should be grouped onto ``new_leader`` after the handoff.
-        """
-        # Resolve this (old) leader's active session target.
-        old_target: Player = self
-        if (
-            self.active_output_protocol
-            and self.active_output_protocol != "native"
-            and (protocol_player := self.mass.players.get_player(self.active_output_protocol))
-        ):
-            old_target = protocol_player
-        # Guard: this operation requires that the provider actually supports
-        # removing the leader without tearing down the session. Callers should
-        # check the capability first, but enforce it defensively here too.
-        if not old_target.provider.supports_dynamic_leader_switching:
-            raise NotImplementedError(
-                f"Provider {old_target.provider.domain} does not support dynamic leader "
-                "switching; the sync session must be torn down and re-formed instead."
-            )
-        # Step out of the live session (bypasses cmd_set_members self-dissolve).
-        await old_target.set_members(player_ids_to_remove=[old_target.player_id])
-        # Attach remaining members to the new leader via the normal controller
-        # path (handles protocol linking/grouping).
-        if remaining_members:
-            await self.mass.players.cmd_set_members(
-                new_leader.player_id,
-                player_ids_to_add=remaining_members,
-            )
-
     @property
     @final
     def state(self) -> PlayerState:
@@ -1059,6 +1120,21 @@ class Player(ABC):
                     name=self.provider.name,
                     protocol_domain=self.provider.domain,
                     priority=0,  # Native is always highest priority
+                    available=self.available,
+                    is_native=True,
+                )
+            )
+        elif (
+            self.provider.domain in PROTOCOL_PRIORITY
+            and PlayerFeature.SET_MEMBERS in self.supported_features
+        ):
+            # Player is itself a native endpoint of a known protocol domain.
+            result.append(
+                OutputProtocol(
+                    output_protocol_id=self.player_id,
+                    name=self.provider.name,
+                    protocol_domain=self.provider.domain,
+                    priority=PROTOCOL_PRIORITY[self.provider.domain],
                     available=self.available,
                     is_native=True,
                 )
@@ -1324,6 +1400,22 @@ class Player(ABC):
             self._attr_current_media.custom_data = custom_data
 
     @final
+    def set_resolved_palette(self, image_url: str, palette: MediaItemPalette) -> None:
+        """
+        Store the resolved color palette for the currently shown image.
+
+        The palette is resolved asynchronously (from the cache controller) by the
+        PlayerController; it is carried on the player here so the synchronous state
+        serialization can attach it without blocking. May only be called by the
+        PlayerController.
+
+        :param image_url: Image URL the palette was extracted from.
+        :param palette: The extracted color palette.
+        """
+        self._attr_current_palette_url = image_url
+        self._attr_current_palette = palette
+
+    @final
     def set_config(self, config: PlayerConfig) -> None:
         """
         Set/update the player config.
@@ -1363,7 +1455,7 @@ class Player(ABC):
             return ""
         return (
             f"{media.uri}|{media.title}|{media.source_id}|{media.queue_item_id}|"
-            f"{media.image_url}|{media.duration}|{media.elapsed_time}"
+            f"{media.image_url}|{media.duration}|{media.elapsed_time}|{media.palette}"
         )
 
     @final
@@ -1538,11 +1630,8 @@ class Player(ABC):
         elapsed_time: float | None
         elapsed_time_last_updated: float | None
 
-        # If an output protocol is active (and not native), use the protocol player's state
-        # as the source of truth — including when the protocol player is IDLE. Falling
-        # through to the parent/group when the protocol is IDLE creates a circular
-        # dependency (group state derives from sync leader → sync leader → group), which
-        # strands the player in PLAYING forever when the protocol's stream actually ended.
+        # If an output protocol is active (and not native),
+        # use the protocol player's state as the source of truth
         if (
             self.__attr_active_output_protocol
             and self.__attr_active_output_protocol != "native"
@@ -1553,11 +1642,9 @@ class Player(ABC):
             playback_state = protocol_player.state.playback_state
             elapsed_time = protocol_player.state.elapsed_time
             elapsed_time_last_updated = protocol_player.state.elapsed_time_last_updated
-        # If we're synced or part of an active group, use the parent/group player's state
-        # for playback state and elapsed time.
-        # NOTE: Don't do this for the active group player itself,
-        # because the group player relies on the sync leader for state info.
-        elif (parent_id := self.__final_synced_to or self.__final_active_group) and (
+        # If we're synced to another player, mirror the leader's state so that
+        # synced clients report the same playback info as their leader.
+        elif (parent_id := self.__final_synced_to) and (
             parent_player := self.mass.players.get_player(parent_id)
         ):
             playback_state = parent_player.state.playback_state
@@ -1568,18 +1655,34 @@ class Player(ABC):
             elapsed_time = self.elapsed_time
             elapsed_time_last_updated = self.elapsed_time_last_updated
 
-        # If a PluginSource is active with elapsed_time metadata, prefer it
-        # over the player/protocol elapsed_time (which tracks bytes consumed,
-        # not the source's logical playback position).
-        active_source = self.__final_active_source
-        if (
-            active_source
-            and (source := self.mass.players.get_plugin_source(active_source))
-            and source.metadata
-            and source.metadata.elapsed_time is not None
-        ):
-            elapsed_time = source.metadata.elapsed_time
-            elapsed_time_last_updated = source.metadata.elapsed_time_last_updated or time.time()
+        # If the active queue item is an AudioSource with upstream-clock
+        # metadata (e.g. Spotify Connect / AirPlay / Yandex Ynison reporting
+        # the source's logical position), prefer that over the protocol /
+        # self elapsed_time — the latter tracks bytes consumed, which is the
+        # wrong clock for live plugin sources (loses upstream seeks and
+        # pause-resume on the queue's corrected_elapsed_time, which the
+        # player_queues controller and several player providers consume).
+        # A group player outputs the AudioSource from its own queue, which
+        # __final_active_source may not resolve to, so the group's own queue
+        # is also consulted.
+        candidate_source_ids = [self.__final_active_source]
+        if self.type == PlayerType.GROUP:
+            candidate_source_ids.append(self.player_id)
+        for source_id in candidate_source_ids:
+            if (
+                source_id
+                and (queue := self.mass.player_queues.get(source_id))
+                and (current_item := queue.current_item) is not None
+                and (sd := current_item.streamdetails) is not None
+                and sd.media_type == MediaType.AUDIO_SOURCE
+                and sd.stream_metadata is not None
+                and sd.stream_metadata.elapsed_time is not None
+            ):
+                elapsed_time = sd.stream_metadata.elapsed_time
+                elapsed_time_last_updated = (
+                    sd.stream_metadata.elapsed_time_last_updated or time.time()
+                )
+                break
 
         return (playback_state, elapsed_time, elapsed_time_last_updated)
 
@@ -1609,21 +1712,31 @@ class Player(ABC):
         """Return the FINAL volume level based on the playercontrol which may have been set-up."""
         volume_control = self.volume_control
         if volume_control == PLAYER_CONTROL_FAKE:
+            # Fake volume is already stored as logical (0-100)
             return int(self.extra_data.get(ATTR_FAKE_VOLUME, 0))
         if volume_control == PLAYER_CONTROL_NATIVE:
-            return self.volume_level
+            # Scale device volume back to logical (0-100)
+            if self.volume_level is None:
+                return None
+            return self.mass.players.scale_volume_from_device(self.player_id, self.volume_level)
         if volume_control == PLAYER_CONTROL_NONE:
             return None
         # handle protocol player as volume control
         if control := self.mass.players.get_player(volume_control):
             if control.volume_level is not None:
-                return control.volume_level
+                return self.mass.players.scale_volume_from_device(
+                    self.player_id, control.volume_level
+                )
         # handle player control for volume if set
         if player_control := self.mass.players.get_player_control(volume_control):
             if player_control.volume_level is not None:
-                return player_control.volume_level
+                return self.mass.players.scale_volume_from_device(
+                    self.player_id, player_control.volume_level
+                )
         # control not (yet) available or has no volume, fall back to native
-        return self.volume_level
+        if self.volume_level is None:
+            return None
+        return self.mass.players.scale_volume_from_device(self.player_id, self.volume_level)
 
     @cached_property
     @final
@@ -1667,7 +1780,19 @@ class Player(ABC):
                 continue
             if group_player.player_id == self.player_id:
                 continue
-            if group_player.playback_state not in (PlaybackState.PLAYING, PlaybackState.PAUSED):
+            # Use the raw `powered` attribute (not `state.powered`) so the
+            # check reflects what the group player itself believes — for
+            # native/fake control the group's `power()` method sets
+            # `_attr_powered` directly. `state.powered` routes through
+            # `__final_power_state` which may return None for power_control
+            # == NONE even though the group is actively capturing members.
+            powered = group_player.powered
+            if powered is False:
+                # explicit power-off (fake or native) - never captures members
+                continue
+            if powered is not True and not group_player.is_active_session:
+                # no explicit power-on and no captured session - group is dormant,
+                # configured members are free to be controlled individually
                 continue
             if self.player_id in group_player.state.group_members:
                 return group_player.player_id
@@ -1688,26 +1813,8 @@ class Player(ABC):
         if self.type == PlayerType.PROTOCOL and self.__attr_protocol_parent_id:
             if parent_player := self.mass.players.get_player(self.__attr_protocol_parent_id):
                 return parent_player.state.current_media
-        # if a pluginsource is currently active, return those details
-        active_source = self.__final_active_source
-        if (
-            active_source
-            and (source := self.mass.players.get_plugin_source(active_source))
-            and source.metadata
-        ):
-            return PlayerMedia(
-                uri=source.metadata.uri or source.id,
-                media_type=MediaType.PLUGIN_SOURCE,
-                title=source.metadata.title,
-                artist=source.metadata.artist,
-                album=source.metadata.album,
-                image_url=source.metadata.image_url,
-                duration=source.metadata.duration,
-                source_id=source.id,
-                elapsed_time=source.metadata.elapsed_time,
-                elapsed_time_last_updated=source.metadata.elapsed_time_last_updated,
-            )
         # if MA queue is active, return those details
+        active_source = self.__final_active_source
         active_queue: PlayerQueue | None = None
         if not active_queue and active_source:
             active_queue = self.mass.player_queues.get(active_source)
@@ -1715,8 +1822,8 @@ class Player(ABC):
             active_queue = self.mass.player_queues.get(self.player_id)
         if active_queue and (current_item := active_queue.current_item):
             item_image_url = (
-                # the image format needs to be 500x500 jpeg for maximum compatibility with players
-                self.mass.metadata.get_image_url(current_item.image, size=500, image_format="jpeg")
+                # the image format needs to be 512x512 jpeg for maximum compatibility with players
+                self.mass.metadata.get_image_url(current_item.image, size=512)
                 if current_item.image
                 else None
             )
@@ -1724,13 +1831,15 @@ class Player(ABC):
                 stream_metadata := current_item.streamdetails.stream_metadata
             ):
                 # handle stream metadata in streamdetails (e.g. for radio stream)
+                image_url = stream_metadata.image_url or item_image_url
                 return PlayerMedia(
                     uri=current_item.uri,
                     media_type=current_item.media_type,
                     title=stream_metadata.title or current_item.name,
                     artist=stream_metadata.artist,
                     album=stream_metadata.album or stream_metadata.description or current_item.name,
-                    image_url=(stream_metadata.image_url or item_image_url),
+                    image_url=image_url,
+                    palette=self._resolved_palette(image_url),
                     duration=stream_metadata.duration or current_item.duration,
                     source_id=active_queue.queue_id,
                     queue_item_id=current_item.queue_item_id,
@@ -1746,19 +1855,20 @@ class Player(ABC):
                 podcast = getattr(media_item, "podcast", None)
                 metadata = getattr(media_item, "metadata", None)
                 description = getattr(metadata, "description", None) if metadata else None
+                image_url = (
+                    self.mass.metadata.get_image_url(current_item.media_item.image, size=512)
+                    or item_image_url
+                    if current_item.media_item.image
+                    else item_image_url
+                )
                 return PlayerMedia(
                     uri=str(media_item.uri),
                     media_type=media_item.media_type,
                     title=f"{media_item.name} ({version})" if version else media_item.name,
                     artist=getattr(media_item, "artist_str", None),
                     album=album.name if album else podcast.name if podcast else description,
-                    # the image format needs to be 500x500 jpeg for maximum player compatibility
-                    image_url=self.mass.metadata.get_image_url(
-                        current_item.media_item.image, size=500, image_format="jpeg"
-                    )
-                    or item_image_url
-                    if current_item.media_item.image
-                    else item_image_url,
+                    image_url=image_url,
+                    palette=self._resolved_palette(image_url),
                     duration=media_item.duration,
                     source_id=active_queue.queue_id,
                     queue_item_id=current_item.queue_item_id,
@@ -1772,6 +1882,7 @@ class Player(ABC):
                 media_type=current_item.media_type,
                 title=current_item.name,
                 image_url=item_image_url,
+                palette=self._resolved_palette(item_image_url),
                 duration=current_item.duration,
                 source_id=active_queue.queue_id,
                 queue_item_id=current_item.queue_item_id,
@@ -1783,13 +1894,15 @@ class Player(ABC):
             return None
         # return native current media if no group/queue is active
         if self.current_media:
+            image_url = self.current_media.image_url
             return PlayerMedia(
                 uri=self.current_media.uri,
                 media_type=self.current_media.media_type,
                 title=self.current_media.title,
                 artist=self.current_media.artist,
                 album=self.current_media.album,
-                image_url=self.current_media.image_url,
+                image_url=image_url,
+                palette=self._resolved_palette(image_url),
                 duration=self.current_media.duration,
                 source_id=self.current_media.source_id or active_source,
                 queue_item_id=self.current_media.queue_item_id,
@@ -1799,6 +1912,12 @@ class Player(ABC):
                 elapsed_time_last_updated=self.current_media.elapsed_time_last_updated
                 or self.elapsed_time_last_updated,
             )
+        return None
+
+    def _resolved_palette(self, image_url: str | None) -> MediaItemPalette | None:
+        """Return the carried palette if it matches image_url, else None."""
+        if image_url and image_url == self._attr_current_palette_url:
+            return self._attr_current_palette
         return None
 
     @cached_property
@@ -1822,12 +1941,6 @@ class Player(ABC):
                 can_next_previous=True,
             )
             sources.append(mass_source)
-        # append all/any plugin sources (convert to PlayerSource to avoid deepcopy issues)
-        for plugin_source in self.mass.players.get_plugin_sources():
-            if hasattr(plugin_source, "as_player_source"):
-                sources.append(plugin_source.as_player_source())
-            else:
-                sources.append(plugin_source)
         return sources
 
     @cached_property
@@ -1934,6 +2047,8 @@ class Player(ABC):
             base_features.add(PlayerFeature.VOLUME_MUTE)
         else:
             base_features.discard(PlayerFeature.VOLUME_MUTE)
+        if sum(1 for s in self.__final_source_list if not s.passive) >= 2:
+            base_features.add(PlayerFeature.SELECT_SOURCE)
         return base_features
 
     @cached_property
@@ -2039,11 +2154,6 @@ class Player(ABC):
         ):
             return parent_player.state.active_source
 
-        # if a plugin source is active that belongs to this player, return that
-        for plugin_source in self.mass.players.get_plugin_sources():
-            if plugin_source.in_use_by == self.player_id:
-                return plugin_source.id
-
         # always prefer active MA source but add a guard to detect if player is really playing
         # something different, such as a line-in or TV input, we use an explicit list here
         # because many players do not accurately report the active_source
@@ -2119,15 +2229,9 @@ class Player(ABC):
         if active_source == self.player_id:
             return False
 
-        # Check if it's a known queue ID
-        if self.mass.player_queues.get(active_source):
-            return False
-
-        # Check if it's a plugin source - if not, it's an external source
-        return not any(
-            plugin_source.id == active_source
-            for plugin_source in self.mass.players.get_plugin_sources()
-        )
+        # If it's a known queue ID it's MA-managed; anything else is external
+        # (line-in, TV input, etc.)
+        return self.mass.player_queues.get(active_source) is None
 
     @final
     def _expand_can_group_with(self) -> set[Player]:

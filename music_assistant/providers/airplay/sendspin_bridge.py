@@ -40,6 +40,7 @@ from music_assistant.providers.sendspin.helpers import bridge_client_id_from_mac
 
 from .constants import StreamingProtocol
 from .helpers import player_id_to_mac_address, unix_time_to_ntp
+from .protocols.airplay2 import AirPlay2Stream
 from .protocols.raop import RaopStream
 
 if TYPE_CHECKING:
@@ -54,7 +55,8 @@ if TYPE_CHECKING:
 
 
 def get_bridge_client_id(airplay_player: AirPlayPlayer) -> str | None:
-    """Get the Sendspin bridge client ID for an AirPlay player.
+    """
+    Get the Sendspin bridge client ID for an AirPlay player.
 
     Uses the MAC address as the client_id to enable protocol linking.
     The Sendspin provider will create a SendspinPlayer with this client_id.
@@ -69,7 +71,8 @@ def get_bridge_client_id(airplay_player: AirPlayPlayer) -> str | None:
 
 
 class SendspinAirPlayBridge:
-    """Manages the Sendspin to AirPlay bridge for a single player.
+    """
+    Manages the Sendspin to AirPlay bridge for a single player.
 
     This class handles:
     1. Registering the AirPlay player as an external Sendspin client
@@ -83,7 +86,8 @@ class SendspinAirPlayBridge:
         airplay_player: AirPlayPlayer,
         sendspin_server: SendspinServer,
     ) -> None:
-        """Initialize the bridge.
+        """
+        Initialize the bridge.
 
         :param provider: The AirPlay provider instance.
         :param airplay_player: The AirPlay player to bridge.
@@ -182,6 +186,7 @@ class SendspinAirPlayBridge:
                 initial_volume=self.airplay_player.volume_level or 25,
             )
             self._bridge_role.setup_audio_requirements()
+            self._refresh_bridge_timing()
 
         self.logger.info(
             "Sendspin bridge registered for %s (client_id=%s)",
@@ -200,8 +205,24 @@ class SendspinAirPlayBridge:
 
         self.logger.debug("Sendspin bridge stopped for %s", self.airplay_player.display_name)
 
+    def _refresh_bridge_timing(self) -> None:
+        """
+        Push the AirPlay startup latency to the bridge role.
+
+        ``wait_start`` is the lead time the device needs before audio begins, so
+        Sendspin schedules the first chunk that far ahead instead of dropping it.
+        ``min_buffer_ms`` is 0 — the device carries its own jitter buffer.
+        """
+        if self._bridge_role is None:
+            return
+        self._bridge_role.set_timing(
+            required_lead_time_ms=int(self.airplay_player.wait_start),
+            min_buffer_ms=0,
+        )
+
     def _on_stream_start(self, request: ExternalStreamStartRequest) -> None:
-        """Handle stream start request from Sendspin server.
+        """
+        Handle stream start request from Sendspin server.
 
         Called when Sendspin wants to play audio to this bridge player.
         aiosendspin handles role lifecycle (on_connect, push stream join).
@@ -218,6 +239,8 @@ class SendspinAirPlayBridge:
                 self.airplay_player.display_name,
             )
             return
+        # Bridge outlives config changes, so re-read wait_start for the current protocol.
+        self._refresh_bridge_timing()
         # Capture and detach old stream resources before scheduling their cleanup.
         # This prevents the async cleanup from accidentally destroying the new
         # stream's resources, which reuse the same instance variables.
@@ -245,20 +268,31 @@ class SendspinAirPlayBridge:
         self._start_aligned = False
 
     def _on_bridge_stream_start(self) -> None:
-        """Start the writer task when the PushStream notifies us the stream has started.
+        """
+        Start the writer task when the PushStream notifies us the stream has started.
 
         Called via the BridgePlayerRole.on_stream_start callback when the
         PushStream begins delivering audio chunks.
         """
-        # Cancel any existing writer task (leftover from previous stream)
-        if self._writer_task is not None and not self._writer_task.done():
-            self._writer_task.cancel()
-        # Re-assert streaming state and clear protocol references so the first
-        # audio chunk triggers a fresh protocol start. This is needed because
-        # the async cleanup scheduled by _on_stream_start may have cleared
-        # _is_streaming and _protocol_start_task between then and now.
-        self._is_streaming = True
+        # The stream might not yet be cleaned up completely (on rapid skips for example)
+        old_stream = self._airplay_stream
+        old_writer_task = self._writer_task
+        old_stream_start_task = self._airplay_stream_start_task
+
+        self._airplay_stream = None
+        self._writer_task = None
         self._airplay_stream_start_task = None
+        self.airplay_player.stream = None
+
+        if old_stream or old_writer_task or old_stream_start_task:
+            prev_cleanup = self._cleanup_task
+            self._cleanup_task = self.mass.create_task(
+                self._cleanup_old_stream(
+                    old_stream, old_writer_task, old_stream_start_task, prev_cleanup
+                )
+            )
+
+        self._is_streaming = True
         self._airplay_stream_ready.clear()
         self._next_expected_timestamp_us = None
         self._drop_until_us = 0
@@ -285,22 +319,32 @@ class SendspinAirPlayBridge:
 
             # Derive start_ntp from _drop_until_us (set on first chunk arrival)
             # to give the CLI enough lead time to connect and fill the output buffer.
-            future_s = self._drop_until_us / 1_000_000 - time.monotonic()
-            start_ntp = unix_time_to_ntp(time.time() + future_s)
+            # _drop_until_us may use a different clock, convert to NTP
+            sendspin_clock_now_us = self.sendspin_server.clock.now_us()
+            unix_clock_now = time.time()
+            future_s = (self._drop_until_us - sendspin_clock_now_us) / 1_000_000
+            start_ntp = unix_time_to_ntp(unix_clock_now + future_s)
 
-            # Always use RAOP for the bridge — AP2 (cliap2) doesn't respect
-            # NTP start times correctly, breaking multi-device sync.
-            # See https://github.com/music-assistant/cliairplay/issues/102
-            if not self.airplay_player.raop_discovery_info:
-                self.logger.warning(
-                    "Cannot start bridge for %s: RAOP not available on this device",
-                    self.airplay_player.display_name,
-                )
+            # On a rapid skip, _on_bridge_stream_start snapshots self._airplay_stream
+            # for cleanup. If we assigned it earlier, the new stream would be missed
+            # and leaked. Only publish once start() succeeds and this task is current.
+            new_stream: AirPlayProtocol
+            if self.airplay_player.protocol == StreamingProtocol.AIRPLAY2:
+                new_stream = AirPlay2Stream(self.airplay_player)
+            else:
+                new_stream = RaopStream(self.airplay_player)
+            try:
+                await new_stream.start(start_ntp)
+            except BaseException:
+                with suppress(Exception):
+                    await new_stream.stop(force=True)
+                raise
+            if asyncio.current_task() is not self._airplay_stream_start_task:
+                with suppress(Exception):
+                    await new_stream.stop(force=True)
                 return
-            self._airplay_stream = RaopStream(self.airplay_player)
-            self.airplay_player.stream = self._airplay_stream
-
-            await self._airplay_stream.start(start_ntp)
+            self._airplay_stream = new_stream
+            self.airplay_player.stream = new_stream
             self._airplay_stream_ready.set()
             self.logger.info(
                 "Bridge protocol started for %s (NTP=%s, lookahead=%.0fms)",
@@ -315,12 +359,6 @@ class SendspinAirPlayBridge:
                 self.airplay_player.display_name,
                 err,
             )
-            # Clean up partially created protocol
-            if self._airplay_stream:
-                with suppress(Exception):
-                    await self._airplay_stream.stop(force=True)
-                self._airplay_stream = None
-                self.airplay_player.stream = None
             # Stop accepting chunks, unblock the writer, and schedule full cleanup
             self._is_streaming = False
             self._airplay_stream_ready.set()
@@ -351,7 +389,8 @@ class SendspinAirPlayBridge:
         self.mass.create_task(self.airplay_player.volume_mute(muted))
 
     def _on_bridge_stream_end(self) -> None:
-        """Stop the AirPlay protocol immediately when the stream ends.
+        """
+        Stop the AirPlay protocol immediately when the stream ends.
 
         Rather than just sending EOF (which lets the CLI play out its buffer),
         we schedule a full cleanup that kills the CLI process immediately.
@@ -363,7 +402,8 @@ class SendspinAirPlayBridge:
         self._schedule_cleanup()
 
     def _schedule_cleanup(self) -> None:
-        """Schedule cleanup of the current stream resources under the bridge lock.
+        """
+        Schedule cleanup of the current stream resources under the bridge lock.
 
         Uses _stop_streaming_locked which acquires self._lock, so concurrent
         cleanups are serialized safely.
@@ -382,7 +422,8 @@ class SendspinAirPlayBridge:
         stream_start_task: asyncio.Task[None] | None,
         prev_cleanup: asyncio.Task[None] | None = None,
     ) -> None:
-        """Clean up captured resources from a previous stream.
+        """
+        Clean up captured resources from a previous stream.
 
         Unlike _stop_streaming(), this operates on explicitly captured references
         rather than instance variables. This prevents a race condition where the
@@ -435,8 +476,8 @@ class SendspinAirPlayBridge:
         if self._airplay_stream_start_task is None:
             # Set the target start time (wait_start) in the future so the CLI
             # has enough time to connect and fill the device's output buffer.
-            wait_start_s = self.airplay_player.wait_start / 1000
-            self._drop_until_us = int((time.monotonic() + wait_start_s) * 1_000_000)
+            wait_start_us = int(self.airplay_player.wait_start * 1_000)
+            self._drop_until_us = self.sendspin_server.clock.now_us() + wait_start_us
             self._start_aligned = False
             self._airplay_stream_start_task = self.mass.create_task(
                 self._start_protocol_from_chunk()
@@ -509,7 +550,8 @@ class SendspinAirPlayBridge:
         return True
 
     async def _cli_writer(self) -> None:
-        """Write queued audio data to the CLI process stdin.
+        """
+        Write queued audio data to the CLI process stdin.
 
         Waits for any pending cleanup and then for the new protocol to be
         ready before writing. Runs as a single task so writes are serialised
@@ -579,7 +621,8 @@ class SendspinBridgeManager:
     """Manages Sendspin bridges for all AirPlay players."""
 
     def __init__(self, provider: AirPlayProvider) -> None:
-        """Initialize the bridge manager.
+        """
+        Initialize the bridge manager.
 
         :param provider: The AirPlay provider instance.
         """
@@ -620,24 +663,6 @@ class SendspinBridgeManager:
                 self.logger.debug("Bridge already exists for %s", airplay_player.display_name)
                 return
 
-            # Bridge always uses RAOP for sync — skip if AP2 is selected or
-            # RAOP discovery info is not available.
-            # AP2 (cliap2) doesn't respect NTP start times correctly,
-            # so it cannot be used for synchronized multi-device playback.
-            # See https://github.com/music-assistant/cliairplay/issues/102
-            if airplay_player.protocol == StreamingProtocol.AIRPLAY2:
-                self.logger.debug(
-                    "Skipping Sendspin bridge for %s: AP2 sync not supported",
-                    airplay_player.display_name,
-                )
-                return
-            if not airplay_player.raop_discovery_info:
-                self.logger.debug(
-                    "Skipping Sendspin bridge for %s: RAOP not available",
-                    airplay_player.display_name,
-                )
-                return
-
             bridge = SendspinAirPlayBridge(self.provider, airplay_player, sendspin_server)
 
             try:
@@ -676,7 +701,8 @@ class SendspinBridgeManager:
         self.logger.debug("All Sendspin bridges stopped")
 
     def stop_streaming(self, airplay_player_id: str) -> bool:
-        """Stop streaming for a bridged AirPlay player.
+        """
+        Stop streaming for a bridged AirPlay player.
 
         :param airplay_player_id: The AirPlay player ID.
         :return: True if a bridge was found and stopped, False otherwise.
