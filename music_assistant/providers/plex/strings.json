@@ -21,6 +21,15 @@
       "description": "The library to connect to (e.g. Music)",
       "action_label": "Select Plex Music Library"
     },
+    "library_type": {
+      "label": "Library Type",
+      "description": "Select whether this Plex library should be treated as Music, Audiobooks, or Podcasts.",
+      "options": {
+        "music": "Music",
+        "audiobooks": "Audiobooks",
+        "podcasts": "Podcasts"
+      }
+    },
     "import_collections": {
       "label": "Import Collections",
       "description": "Import collections (tracks, albums, or artists) as playlists"
@@ -44,6 +53,10 @@
     "hub_items_limit": {
       "label": "Items per hub",
       "description": "Maximum number of items to load from each hub (default: 10)"
+    },
+    "extended_recommendations": {
+      "label": "Extended recommendations",
+      "description": "Show additional recommendation hubs in the dashboard, including 'Mixes For You', recent library playlists, and 'On This Day' releases. Matches the hub set Plex's own clients surface. Changes take effect on the next recommendations refresh."
     },
     "gdm": {
       "label": "Use Plex GDM to discover local servers",

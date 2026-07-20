@@ -22,6 +22,24 @@ class TrackBrief:
     artists: list[str] = field(default_factory=list)
     album: str | None = None
     duration: int | None = None
+    disc_number: int | None = None
+    track_number: int | None = None
+
+
+@dataclass
+class AlbumTracksResult:
+    """An album summary plus its track listing in disc/track order."""
+
+    album: AlbumBrief
+    tracks: list[TrackBrief] = field(default_factory=list)
+
+
+@dataclass
+class ArtistAlbumsResult:
+    """An artist summary plus their album discography."""
+
+    artist: ArtistBrief
+    albums: list[AlbumBrief] = field(default_factory=list)
 
 
 @dataclass
@@ -88,6 +106,7 @@ class QueueItemBrief:
 
     item_id: str
     name: str
+    index: int
     duration: int | None = None
     artists: list[str] = field(default_factory=list)
 
@@ -110,6 +129,36 @@ class QueueBrief:
     repeat: str
     items: list[QueueItemBrief] = field(default_factory=list)
     available: bool = True
+    index_in_buffer: int | None = None
+    next_insertable_index: int | None = None
+    items_start_index: int = 0
+
+
+@dataclass
+class RemoveFromQueueResult:
+    """
+    Per-item outcome of a ``remove_item`` call.
+
+    Every requested ``item_id`` lands in exactly one bucket, so the caller
+    always learns the fate of the full batch — including rows deleted before
+    a later id turned out to be stale.
+    """
+
+    removed: list[str] = field(default_factory=list)
+    skipped_played: list[str] = field(default_factory=list)
+    skipped_buffered: list[str] = field(default_factory=list)
+    not_found: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AddToQueueResult:
+    """Confirmation of a successful ``add_to_queue`` call."""
+
+    item_id: str
+    uri: str
+    name: str
+    option: str
+    index: int | None = None
 
 
 @dataclass
@@ -155,7 +204,7 @@ class ProviderInspect:
 
 @dataclass(frozen=True, kw_only=True)
 class LogLine:
-    """One parsed line from musicassistant.log."""
+    """One parsed record from musicassistant.log (continuation lines joined into message)."""
 
     timestamp: str | None
     level: str | None
@@ -169,6 +218,32 @@ class LogTailResult:
 
     log_path: str
     lines: list[LogLine]
+    bytes_scanned: int
+    truncated: bool
+    has_more: bool = False
+    response_truncated: bool = False
+    next_call_hint: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ComponentCount:
+    """Record count for one log component."""
+
+    component: str
+    count: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class LogStatsResult:
+    """Result of debug_log_stats."""
+
+    log_path: str
+    window_seconds: int | None
+    total_records: int
+    level_counts: dict[str, int]
+    top_components: list[ComponentCount]
+    first_timestamp: str | None
+    last_timestamp: str | None
     bytes_scanned: int
     truncated: bool
 
@@ -339,7 +414,7 @@ class ConfigEntryDump:
 
     key: str
     type: str
-    label: str
+    label: str | None
     default_value: Any
     required: bool
     description: str | None

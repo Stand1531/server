@@ -9,6 +9,7 @@ import time
 from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption, ConfigValueType
+from music_assistant_models.constants import PLAYER_CONTROL_NATIVE
 from music_assistant_models.enums import (
     ConfigEntryType,
     IdentifierType,
@@ -243,18 +244,17 @@ class AirPlayPlayer(Player):
                 key=CONF_AIRPLAY_PROTOCOL,
                 type=ConfigEntryType.INTEGER,
                 required=False,
+                # a protocol the device does not advertise is shown disabled (with a reason)
+                # rather than omitted, so the option set is consistent across devices.
                 options=[
-                    opt
-                    for opt in (
-                        ConfigValueOption(0),
-                        ConfigValueOption(StreamingProtocol.RAOP.value)
-                        if self.raop_discovery_info
-                        else None,
-                        ConfigValueOption(StreamingProtocol.AIRPLAY2.value)
-                        if self.airplay_discovery_info
-                        else None,
-                    )
-                    if opt is not None
+                    ConfigValueOption(0),
+                    ConfigValueOption(
+                        StreamingProtocol.RAOP.value, disabled=not self.raop_discovery_info
+                    ),
+                    ConfigValueOption(
+                        StreamingProtocol.AIRPLAY2.value,
+                        disabled=not self.airplay_discovery_info,
+                    ),
                 ],
                 default_value=0,
                 category="protocol_generic",
@@ -407,7 +407,12 @@ class AirPlayPlayer(Player):
             # setup StreamSession for player (and its sync childs if any)
             sync_clients = self._get_sync_clients()
             provider = cast("AirPlayProvider", self.provider)
-            stream_session = AirPlayStreamSession(provider, sync_clients, AIRPLAY_FLOW_PCM_FORMAT)
+            stream_session = AirPlayStreamSession(
+                provider,
+                sync_clients,
+                AIRPLAY_FLOW_PCM_FORMAT,
+                media,
+            )
             await stream_session.start(audio_source)
             self._attr_elapsed_time = time.time() - stream_session.start_time
             self._attr_elapsed_time_last_updated = time.time()
@@ -628,6 +633,10 @@ class AirPlayPlayer(Player):
             and (parent_player := self.mass.players.get_player(self.protocol_parent_id))
             and parent_player.state.volume_level is not None
         ):
+            if self._has_native_protocol_parent:
+                # Native parent volume is on the receiver/amplifier scale.
+                # Keep the AirPlay child volume learned from DACP feedback instead.
+                return
             if self._attr_volume_level == parent_player.state.volume_level:
                 return
             self._attr_volume_level = parent_player.state.volume_level
@@ -640,9 +649,7 @@ class AirPlayPlayer(Player):
         """Handle logic when the player config is updated."""
         await super().on_config_updated()
         prov = cast("AirPlayProvider", self.provider)
-        bridge_manager = prov.bridge_manager
-        if bridge_manager.get_bridge(self.player_id) is None:
-            await bridge_manager.setup_bridge(self)
+        await prov.bridge_manager.evaluate_bridge(self)
 
     async def on_unload(self) -> None:
         """Handle logic when the player is unloaded from the Player controller."""
@@ -655,6 +662,14 @@ class AirPlayPlayer(Player):
         if self._active_pairing:
             await self._active_pairing.close()
             self._active_pairing = None
+
+    @property
+    def _has_native_protocol_parent(self) -> bool:
+        """Return True if this AirPlay protocol player is linked to a native parent."""
+        if not self.protocol_parent_id:
+            return False
+        parent_player = self.mass.players.get_player(self.protocol_parent_id)
+        return bool(parent_player and parent_player.volume_control == PLAYER_CONTROL_NATIVE)
 
     def _get_flags(self) -> int:
         # Flags are either present via "sf" or "flags". Taken from pyatv.protocols.airplay.utils.

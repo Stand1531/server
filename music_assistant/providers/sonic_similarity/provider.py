@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+from music_assistant_models.auth import Scope
 from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.enums import MediaType, ProviderFeature
 from music_assistant_models.errors import MusicAssistantError, SetupFailedError
@@ -57,6 +58,7 @@ from music_assistant.providers.sonic_similarity.helpers import (
     _parse_similar_params,
     _parse_weights,
     apply_filters,
+    format_text_query,
 )
 from music_assistant.providers.sonic_similarity.models import SimilarParams, _SearchContext
 from music_assistant.providers.sonic_similarity.similarity import (
@@ -141,14 +143,20 @@ class SonicSimilarityPlugin(PluginProvider):
     async def loaded_in_mass(self) -> None:
         """Register similarity API commands and set up the optional CLAP engine."""
         self._unregister_handles.append(
-            self.mass.register_api_command("sonic_similarity/similar", self._handle_similar)
-        )
-        self._unregister_handles.append(
-            self.mass.register_api_command("sonic_similarity/status", self._handle_status)
+            self.mass.register_api_command(
+                "sonic_similarity/similar", self._handle_similar, required_scope=Scope.LIBRARY_READ
+            )
         )
         self._unregister_handles.append(
             self.mass.register_api_command(
-                "sonic_similarity/rebuild_index", self._handle_rebuild_index
+                "sonic_similarity/status", self._handle_status, required_scope=Scope.LIBRARY_READ
+            )
+        )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "sonic_similarity/rebuild_index",
+                self._handle_rebuild_index,
+                required_scope=Scope.LIBRARY_MANAGE,
             )
         )
 
@@ -163,7 +171,9 @@ class SonicSimilarityPlugin(PluginProvider):
                 await self._clap_index.load()
                 self._unregister_handles.append(
                     self.mass.register_api_command(
-                        "sonic_similarity/similar_clap", self._handle_similar_clap
+                        "sonic_similarity/similar_clap",
+                        self._handle_similar_clap,
+                        required_scope=Scope.LIBRARY_READ,
                     )
                 )
                 await self._rebuild_clap_index_from_database()
@@ -178,7 +188,9 @@ class SonicSimilarityPlugin(PluginProvider):
         if text_search_enabled:
             self._unregister_handles.append(
                 self.mass.register_api_command(
-                    "sonic_similarity/text_search", self._handle_text_search
+                    "sonic_similarity/text_search",
+                    self._handle_text_search,
+                    required_scope=Scope.LIBRARY_READ,
                 )
             )
             # The ~500MB GPT2 text encoder loads lazily on the first query (see search()
@@ -467,7 +479,8 @@ class SonicSimilarityPlugin(PluginProvider):
         seed_weights: list[float] | None = None,
         diversity: float = 0.0,
         preset: str = "balanced",
-        candidates: int = 50,
+        # Candidate pool size for the weighted rerank (large enough for the aggressive presets).
+        candidates: int = 200,
         filter_genres: list[str] | None = None,
         filter_providers: list[str] | None = None,
         exclude_track_ids: list[str] | None = None,
@@ -647,15 +660,23 @@ class SonicSimilarityPlugin(PluginProvider):
         self, ctx: _SearchContext, candidates: list[Candidate]
     ) -> list[Candidate]:
         """Apply genre/artist filters and metadata reranking when configured."""
-        if ctx.params.filter_genres or ctx.params.exclude_artists:
+        needs_filter = bool(ctx.params.filter_genres or ctx.params.exclude_artists)
+        needs_rerank = ctx.weights.get("genre", 0.0) > 0 or ctx.weights.get("era", 0.0) > 0
+        if not (needs_filter or needs_rerank):
+            return candidates
+        # Resolve each candidate's track once; filter and rerank share this map
+        # so a filtered call no longer resolves its survivors twice.
+        resolved = await self._resolve_candidate_track_map(candidates)
+        if needs_filter:
             candidates = await self._apply_metadata_filters(
                 candidates,
+                resolved,
                 filter_genres=ctx.params.filter_genres,
                 exclude_artists=ctx.params.exclude_artists,
             )
-        if ctx.weights.get("genre", 0.0) > 0 or ctx.weights.get("era", 0.0) > 0:
+        if needs_rerank:
             candidates = await self._apply_metadata_reranking(
-                ctx.valid_seed_ids, candidates, ctx.weights
+                ctx.valid_seed_ids, candidates, ctx.weights, resolved
             )
         return candidates
 
@@ -847,13 +868,49 @@ class SonicSimilarityPlugin(PluginProvider):
                     return pm.item_id, None
         return None, None
 
-    async def _embed_text_query(self, query: str) -> np.ndarray | None:
-        """Encode a free-text query through the CLAP text encoder, or None if unavailable."""
+    async def _embed_text_query(
+        self, query: str, exclude: str | None = None, exclude_weight: float = 1.0
+    ) -> np.ndarray | None:
+        """
+        Encode a free-text query as a unit vector, or None when unusable.
+
+        Returns None when the encoder is unavailable, the query is empty, or the
+        embedding is degenerate (zero norm, which the cosine index cannot rank) —
+        including when ``exclude`` cancels ``query``.
+
+        :param query: Free-text query.
+        :param exclude: Optional text to steer the query embedding away from.
+        :param exclude_weight: Strength of the exclusion.
+        """
         encoder = await self._get_text_encoder()
         if encoder is None:
             return None
-        text_emb = await asyncio.to_thread(encoder.get_text_embeddings, [query])
-        return cast("np.ndarray", text_emb[0].detach().cpu().numpy().astype(np.float32).reshape(-1))
+        keep_text = format_text_query(query)
+        if not keep_text:
+            return None
+        # CLAP ignores literal negation ("not loud" ~= "loud"), so exclusion is a
+        # vector subtraction. Each side is unit-normalised first so the exclude term
+        # steers by direction, not by raw magnitude.
+        exclude_text = format_text_query(exclude) if exclude else ""
+        prompts = [keep_text, exclude_text] if exclude_text else [keep_text]
+        embeddings = await asyncio.to_thread(encoder.get_text_embeddings, prompts)
+
+        def _unit(index: int) -> np.ndarray | None:
+            vec = embeddings[index].detach().cpu().numpy().astype(np.float32).reshape(-1)
+            norm = float(np.linalg.norm(vec))
+            return cast("np.ndarray", vec / norm) if norm else None
+
+        keep = _unit(0)
+        if keep is None:
+            return None
+        if not exclude_text:
+            return keep
+        neg = _unit(1)
+        if neg is None:
+            return keep
+        result = keep - exclude_weight * neg
+        norm = float(np.linalg.norm(result))
+        return cast("np.ndarray", result / norm) if norm else None
 
     async def _handle_status(self) -> dict[str, Any]:
         """Return current analysis status."""
@@ -1072,38 +1129,50 @@ class SonicSimilarityPlugin(PluginProvider):
             return set()
         return {g.lower() for g in track.metadata.genres}
 
-    async def _resolve_candidate_tracks(
-        self, candidates: list[Candidate], log_context: str
-    ) -> list[tuple[Candidate, Track | None]]:
+    async def _resolve_candidate_track_map(
+        self, candidates: list[Candidate]
+    ) -> dict[tuple[str, str], Track]:
         """
-        Resolve every candidate's Track concurrently; None marks a lookup miss.
+        Resolve the library Track for each candidate, keyed by (item_id, provider).
 
-        Used by metadata-driven filters and rerank — bulk scoring, never
-        display. allow_update_metadata=False prevents this from queuing
-        ~50-250 background metadata-refresh tasks per /similar call.
+        Candidates with no library match are omitted; a missing key means
+        unresolved (no rerank bonus, and dropped when filtering).
+
+        :param candidates: The ANN candidates to resolve for metadata scoring.
         """
+        # Scoring reads only genres/artists/year, so resolve library items in one
+        # query per provider rather than a tracks.get() per candidate. Stay
+        # library-only: sonic_analysis also indexes streamed-but-not-added tracks,
+        # and resolving those via the provider would burst a rate-limited API for a
+        # soft ranking bonus, so non-library candidates are left unresolved.
+        # Dedupe (item_id, provider) and group item ids by provider for one query each.
+        ids_by_provider: dict[str, list[str]] = {}
+        seen: set[tuple[str, str]] = set()
+        for cand in candidates:
+            key = (cand.item_id, cand.provider)
+            if key in seen:
+                continue
+            seen.add(key)
+            ids_by_provider.setdefault(cand.provider, []).append(cand.item_id)
 
-        async def _one(cand: Candidate) -> tuple[Candidate, Track | None]:
-            try:
-                track = await self.mass.music.tracks.get(
-                    cand.item_id, cand.provider, allow_update_metadata=False
-                )
-            except MusicAssistantError as err:
-                self.logger.debug(
-                    "%s lookup failed for %s/%s: %s",
-                    log_context,
-                    cand.provider,
-                    cand.item_id,
-                    err,
-                )
-                return (cand, None)
-            return (cand, track)
+        resolved: dict[tuple[str, str], Track] = {}
+        for provider, item_ids in ids_by_provider.items():
+            library_tracks = await self.mass.music.tracks.get_library_items_by_prov_id(
+                provider_instance_id_or_domain=provider,
+                provider_item_ids=item_ids,
+                limit=len(item_ids),
+            )
+            for track in library_tracks:
+                for mapping in track.provider_mappings:
+                    if provider in (mapping.provider_instance, mapping.provider_domain):
+                        resolved[(mapping.item_id, provider)] = track
 
-        return list(await asyncio.gather(*(_one(c) for c in candidates)))
+        return resolved
 
     async def _apply_metadata_filters(
         self,
         results: list[Candidate],
+        resolved: dict[tuple[str, str], Track],
         filter_genres: list[str] | None = None,
         exclude_artists: list[str] | None = None,
     ) -> list[Candidate]:
@@ -1115,7 +1184,8 @@ class SonicSimilarityPlugin(PluginProvider):
         artist_set = {a.lower() for a in exclude_artists} if exclude_artists else None
 
         filtered: list[Candidate] = []
-        for cand, track in await self._resolve_candidate_tracks(results, "filter"):
+        for cand in results:
+            track = resolved.get((cand.item_id, cand.provider))
             if track is None:
                 continue
 
@@ -1136,6 +1206,7 @@ class SonicSimilarityPlugin(PluginProvider):
         seed_item_ids: list[str],
         results: list[Candidate],
         weights: dict[str, float],
+        resolved: dict[tuple[str, str], Track],
     ) -> list[Candidate]:
         """
         Apply genre and year bonuses to re-rank candidates.
@@ -1145,6 +1216,9 @@ class SonicSimilarityPlugin(PluginProvider):
             single-seed behavior; with N seeds the metadata bonus reflects
             the centroid of the seed set, matching how the audio-distance
             blend already works.
+        :param resolved: Bulk-resolved candidate library tracks keyed by
+            (item_id, provider); a missing key marks an unresolved candidate,
+            which receives no bonus.
         """
         seed_lookups = [self._resolve_seed_track(sid) for sid in seed_item_ids]
         seed_tracks = [t for t in await asyncio.gather(*seed_lookups) if t is not None]
@@ -1160,7 +1234,8 @@ class SonicSimilarityPlugin(PluginProvider):
         seed_year_avg = sum(seed_years) / len(seed_years) if seed_years else None
 
         scored: list[Candidate] = []
-        for cand, cand_track in await self._resolve_candidate_tracks(results, "rerank"):
+        for cand in results:
+            cand_track = resolved.get((cand.item_id, cand.provider))
             bonus = 0.0
             if cand_track is None:
                 scored.append(cand)
@@ -1387,12 +1462,19 @@ class SonicSimilarityPlugin(PluginProvider):
         return CLAP(version="2023", use_cuda=False, text_enabled=True)
 
     async def _handle_text_search(
-        self, query: str, limit: int = 25, resolve: bool = False
+        self,
+        query: str,
+        exclude: str | None = None,
+        exclude_weight: float = 1.0,
+        limit: int = 25,
+        resolve: bool = False,
     ) -> dict[str, Any]:
         """
         Return tracks closest to a natural-language query in CLAP's joint space.
 
         :param query: Free-text query (e.g. "super dancy disco track").
+        :param exclude: Optional text to steer results away from (e.g. "vocals").
+        :param exclude_weight: Strength of the exclusion, clamped to [0, 2].
         :param limit: Max matches to return.
         :param resolve: When True, include track name and artist for each item.
         """
@@ -1403,7 +1485,15 @@ class SonicSimilarityPlugin(PluginProvider):
                 "query": query,
                 "items": [],
             }
-        emb_np = await self._embed_text_query(query)
+        if not format_text_query(query):
+            return {
+                "analyzed": False,
+                "reason": "empty_query",
+                "query": query,
+                "items": [],
+            }
+        exclude_weight = max(0.0, min(2.0, exclude_weight))
+        emb_np = await self._embed_text_query(query, exclude=exclude, exclude_weight=exclude_weight)
         if emb_np is None:
             return {
                 "analyzed": False,

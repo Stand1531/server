@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from copy import deepcopy
 from time import time
 from typing import TYPE_CHECKING, cast
@@ -32,6 +31,7 @@ from music_assistant.constants import (
     DEFAULT_STREAM_HEADERS,
     DLNA_CONTENT_FEATURES_REALTIME,
 )
+from music_assistant.controllers.streams.audio_processing import get_media_session_id
 from music_assistant.helpers.audio import get_mime_type
 from music_assistant.helpers.util import TaskManager
 from music_assistant.models.player import DeviceInfo, Player, PlayerMedia
@@ -308,6 +308,8 @@ class UniversalGroupPlayer(Player):
             audio_source=audio_source,
             audio_format=pivot_format,
             base_pcm_format=pivot_format,
+            queue_id=media.source_id,
+            session_id=get_media_session_id(media),
         )
         base_url = f"{self.mass.streams.base_url}/ugp/{self.player_id}.{fmt_str}"
 
@@ -330,7 +332,10 @@ class UniversalGroupPlayer(Player):
                             media_type=MediaType.FLOW_STREAM,
                             title=self.display_name,
                             source_id=self.player_id,
-                            custom_data={"ugp_player_id": self.player_id},
+                            custom_data={
+                                "ugp_player_id": self.player_id,
+                                "session_id": self.stream.session_id,
+                            },
                         ),
                     )
                 )
@@ -382,7 +387,10 @@ class UniversalGroupPlayer(Player):
                         media_type=MediaType.FLOW_STREAM,
                         title=self.display_name,
                         source_id=self.player_id,
-                        custom_data={"ugp_player_id": self.player_id},
+                        custom_data={
+                            "ugp_player_id": self.player_id,
+                            "session_id": self.stream.session_id,
+                        },
                     ),
                 )
         # handle removals
@@ -586,14 +594,11 @@ class UniversalGroupPlayer(Player):
             "Content-Type": get_mime_type(output_format_str),
         }
         resp = web.StreamResponse(status=200, reason="OK", headers=headers)
-        http_profile = cast("str", self.config.get_value(CONF_HTTP_PROFILE, "chunked"))
+        http_profile = self.get_config_value(CONF_HTTP_PROFILE, "chunked")
         # prefer the child (protocol) player configuration
-        if child_player_id:
-            # player_id may be stale/invalid; fall back to the group profile
-            with contextlib.suppress(KeyError):
-                http_profile = await self.mass.config.get_player_config_value(
-                    child_player_id, CONF_HTTP_PROFILE, default=http_profile, return_type=str
-                )
+        # (child player_id may be stale/invalid; fall back to the group profile)
+        if child_player_id and (child_player := self.mass.players.get_player(child_player_id)):
+            http_profile = child_player.get_config_value(CONF_HTTP_PROFILE, http_profile)
         if http_profile == "chunked" and request.version < HttpVersion11:
             # chunked encoding is not allowed on HTTP/1.0; fall back to
             # connection-close streaming to avoid raising in resp.prepare()
@@ -621,15 +626,19 @@ class UniversalGroupPlayer(Player):
         )
 
         # Generate filter params for the player specific DSP settings
-        filter_params = None
+        output_plan = None
         if child_player_id:
-            filter_params = self.mass.streams.audio.get_player_filter_params(
-                child_player_id, self.stream.input_format, output_format
+            output_plan = self.mass.streams.audio.get_player_output_plan(
+                child_player_id,
+                self.stream.input_format,
+                output_format,
+                queue_id=self.stream.queue_id,
+                session_id=self.stream.session_id,
             )
 
         async for chunk in self.stream.get_stream(
             output_format,
-            filter_params=filter_params,
+            filter_params=output_plan.filter_params if output_plan else None,
         ):
             try:
                 await resp.write(chunk)

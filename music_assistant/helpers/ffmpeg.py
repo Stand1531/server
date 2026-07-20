@@ -9,6 +9,7 @@ import time
 from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import suppress
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger("ffmpeg")
 MINIMAL_FFMPEG_VERSION = 6
 CACHE_ATTR_LIBSOXR_PRESENT: Final[str] = "libsoxr_present"
+CACHE_ATTR_FFMPEG_VERSION: Final[str] = "ffmpeg_version"
+DEFAULT_MP3_BIT_RATE: Final[int] = 320
 
 # Regex patterns to extract audio format details from ffmpeg's stderr output.
 # Examples of the lines we parse:
@@ -389,7 +392,102 @@ async def get_ffmpeg_stream(
             raise AudioError(log_tail)
 
 
-def get_ffmpeg_args(  # noqa: PLR0915
+async def get_ffmpeg_overlay_stream(
+    audio_input: AsyncGenerator[bytes],
+    overlay_input: str,
+    pcm_format: AudioFormat,
+    overlay_volume: int = 100,
+    chunk_size: int | None = None,
+) -> AsyncGenerator[bytes]:
+    """
+    Mix a looping audio overlay into a PCM audio stream.
+
+    The overlay is looped for the full duration of the main stream and the mixed
+    output has the exact same PCM format and duration as the main input. If the
+    overlay input fails mid-stream, the main audio continues unaffected.
+
+    :param audio_input: The main audio stream (raw PCM in ``pcm_format``).
+    :param overlay_input: File path or URL of the overlay audio.
+    :param overlay_volume: Overlay loudness relative to the main audio in
+        percent (100 = equally loud, max 200).
+    :param pcm_format: PCM format of both the main input and the mixed output.
+    :param chunk_size: Optional exact chunk size for the yielded audio.
+    """
+    # the overlay is passed as an extra (first) ffmpeg input, infinitely looped;
+    # the main audio arrives on stdin. amix with duration=first follows the main
+    # input's length, normalize=0 keeps the original levels (no averaging).
+    overlay_input_args = []
+    if overlay_input.startswith("http"):
+        overlay_input_args += [
+            "-reconnect",
+            "1",
+            "-reconnect_delay_max",
+            "10",
+            "-reconnect_streamed",
+            "1",
+        ]
+    overlay_input_args += ["-stream_loop", "-1", "-i", overlay_input]
+    channel_layout = "mono" if pcm_format.channels == 1 else "stereo"
+    # silenceremove strips a near-silent intro from the overlay source (e.g. a soft
+    # fade-in) so it becomes audible right away; it is a no-op for sources that
+    # already start at full level. It runs before volume so detection is based on
+    # the source's own levels rather than the scaled output.
+    filter_complex = (
+        f"[0:a]silenceremove=start_periods=1:start_threshold=-40dB,"
+        f"volume={overlay_volume / 100},"
+        f"aresample={pcm_format.sample_rate},"
+        f"aformat=channel_layouts={channel_layout}[overlay];"
+        "[1:a][overlay]amix=inputs=2:duration=first:normalize=0[mixed]"
+    )
+    async with FFMpeg(
+        audio_input=audio_input,
+        # The overlay is input 0, so ffmpeg probes it before the PCM input and
+        # mutates input_format with its metadata. Keep that mutation local.
+        input_format=copy(pcm_format),
+        output_format=pcm_format,
+        extra_input_args=overlay_input_args,
+        extra_output_args=["-filter_complex", filter_complex, "-map", "[mixed]"],
+        collect_log_history=True,
+    ) as ffmpeg_proc:
+        iterator = ffmpeg_proc.iter_chunked(chunk_size) if chunk_size else ffmpeg_proc.iter_any()
+        async for chunk in iterator:
+            yield chunk
+        if ffmpeg_proc.returncode not in (None, 0):
+            # unclean exit of ffmpeg - raise error with log tail
+            log_tail = "\n" + "\n".join(list(ffmpeg_proc.log_history)[-5:])
+            raise AudioError(log_tail)
+
+
+def get_ffmpeg_resample_filter(
+    input_format: AudioFormat,
+    output_format: AudioFormat,
+    filter_params: list[str],
+) -> str | None:
+    """
+    Return the resampling and dithering filter required for a format conversion.
+
+    :param input_format: Format entering FFmpeg.
+    :param output_format: Requested FFmpeg output format.
+    :param filter_params: Filters that run before resampling.
+    """
+    if input_format.sample_rate == output_format.sample_rate and not (
+        input_format.bit_depth > 16 and output_format.bit_depth == 16
+    ):
+        return None
+    libsoxr_support = get_global_cache_value(CACHE_ATTR_LIBSOXR_PRESENT)
+    # loudnorm and libsoxr cannot be combined due to https://trac.ffmpeg.org/ticket/11323
+    if libsoxr_support and not any("loudnorm" in value for value in filter_params):
+        resample_filter = "aresample=resampler=soxr:precision=30"
+    else:
+        resample_filter = "aresample=resampler=swr"
+    if input_format.sample_rate != output_format.sample_rate:
+        resample_filter += f":osr={output_format.sample_rate}"
+    if output_format.bit_depth == 16 and input_format.bit_depth > 16:
+        resample_filter += ":osf=s16:dither_method=triangular_hp"
+    return resample_filter
+
+
+def get_ffmpeg_args(
     input_format: AudioFormat,
     output_format: AudioFormat,
     filter_params: list[str],
@@ -401,6 +499,7 @@ def get_ffmpeg_args(  # noqa: PLR0915
     loglevel: str = "error",
 ) -> list[str]:
     """Collect all args to send to the ffmpeg process."""
+    filter_params = list(filter_params)
     if extra_args is None:
         extra_args = []
     if extra_input_args is None:
@@ -448,6 +547,13 @@ def get_ffmpeg_args(  # noqa: PLR0915
                 "-reconnect_on_http_error",
                 "5xx,429",
             ]
+            if "-post_data" in extra_input_args:
+                # ffmpeg does not include Range headers on POST reconnects, so byte-range
+                # seeking via reconnect is not available. Mark the stream non-seekable so
+                # demuxers do not attempt end-of-file probes (e.g. OGG duration detection)
+                # that would trigger Range-less restarts from byte 0. MA-initiated seeks
+                # still work via -ss decode-and-discard.
+                input_args += ["-seekable", "0"]
         if input_format.content_type.is_pcm():
             input_args += [
                 "-ac",
@@ -502,7 +608,7 @@ def get_ffmpeg_args(  # noqa: PLR0915
     elif output_format.content_type == ContentType.AAC:
         output_args = ["-f", "adts", "-c:a", "aac", "-b:a", "256k"]
     elif output_format.content_type == ContentType.MP3:
-        output_args = ["-f", "mp3", "-b:a", "320k"]
+        output_args = ["-f", "mp3", "-b:a", f"{DEFAULT_MP3_BIT_RATE}k"]
     elif output_format.content_type == ContentType.WAV:
         pcm_format = ContentType.from_bit_depth(output_format.bit_depth)
         output_args = [
@@ -540,30 +646,11 @@ def get_ffmpeg_args(  # noqa: PLR0915
             *filter_params,
         ]
 
-    # determine if we need to do resampling (or dithering)
-    if input_format.sample_rate != output_format.sample_rate or (
-        input_format.bit_depth > 16 and output_format.bit_depth == 16
+    if resample_filter := get_ffmpeg_resample_filter(
+        input_format,
+        output_format,
+        filter_params,
     ):
-        libsoxr_support = get_global_cache_value(CACHE_ATTR_LIBSOXR_PRESENT)
-        # prefer resampling with libsoxr due to its high quality
-        # but skip if loudnorm filter is present, due to this bug:
-        # https://trac.ffmpeg.org/ticket/11323
-        loudnorm_present = any("loudnorm" in f for f in filter_params)
-        if libsoxr_support and not loudnorm_present:
-            resample_filter = "aresample=resampler=soxr:precision=30"
-        else:
-            resample_filter = "aresample=resampler=swr"
-
-        # sample rate conversion
-        if input_format.sample_rate != output_format.sample_rate:
-            resample_filter += f":osr={output_format.sample_rate}"
-
-        # bit depth conversion: apply dithering when going down to 16 bits
-        # this is only needed when we need to back to 16 bits
-        # when going from 32bits FP to 24 bits no dithering is needed
-        if output_format.bit_depth == 16 and input_format.bit_depth > 16:
-            resample_filter += ":osf=s16:dither_method=triangular_hp"
-
         filter_params.append(resample_filter)
 
     if filter_params and "-filter_complex" not in extra_args:
@@ -599,7 +686,9 @@ async def check_ffmpeg_version() -> None:
         )
     libsoxr_support = "enable-libsoxr" in output.decode()
     # use globals as in-memory cache
-    await set_global_cache_values({CACHE_ATTR_LIBSOXR_PRESENT: libsoxr_support})
+    await set_global_cache_values(
+        {CACHE_ATTR_LIBSOXR_PRESENT: libsoxr_support, CACHE_ATTR_FFMPEG_VERSION: version}
+    )
 
     major_version = int("".join(char for char in version.split(".")[0] if not char.isalpha()))
     if major_version < MINIMAL_FFMPEG_VERSION:
