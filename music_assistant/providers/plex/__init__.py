@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 import plexapi.exceptions
 import plexapi.utils
 import requests
-import urllib3.exceptions
+
 from music_assistant_models.config_entries import (
     ConfigEntry,
     ConfigValueOption,
@@ -155,6 +155,107 @@ AUDIOBOOK_PREFIX = "audiobook:"
 CHAPTER_PREFIX = "Chapter"
 EPISODE_PREFIX = "Episode"
 
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def resolve_plex_server(
+    local_server_ip: str,
+    local_server_port: int,
+    local_server_ssl: bool,
+    local_server_verify_cert: bool,
+    auth_token: str | None,
+    myplex_account: MyPlexAccount | None = None,
+    client_id: str | None = None,
+    client_version: str | None = None,
+) -> PlexServer:
+    """
+    Connect to a Plex server either via local direct connection or via Plex.tv account.
+
+    :param local_server_ip: Local IP address of the Plex server
+    :param local_server_port: Local port of the Plex server
+    :param local_server_ssl: Use HTTPS for local connection
+    :param local_server_verify_cert: Verify SSL certificate
+    :param auth_token: Plex auth token (or AUTH_TOKEN_UNAUTH for local)
+    :param myplex_account: Optional MyPlexAccount object
+    :return: PlexServer instance
+    :raises LoginFailed: if authentication fails or server not found
+    """
+
+    # silence loggers
+    logging.getLogger("plexapi").setLevel(logging.WARNING)
+
+    local_server_protocol = "https" if local_server_ssl else "http"
+    base_url = f"{local_server_protocol}://{local_server_ip}:{local_server_port}"
+
+    session = requests.Session()
+    # Disable SSL verification for LAN Plex
+    session.verify = False
+    session.headers.update(
+        {
+            "X-Plex-Client-Identifier": client_id,
+            "X-Plex-Product": "Music Assistant",
+            "X-Plex-Platform": "Music Assistant",
+            "X-Plex-Version": client_version,
+        }
+    )
+    plex_server: PlexServer | None = None
+
+    # MyPlex authentication path
+    if auth_token and auth_token != AUTH_TOKEN_UNAUTH:
+
+        # Ensure we have a MyPlexAccount
+        if not myplex_account:
+            try:
+                myplex_account = MyPlexAccount(token=auth_token)
+            except Exception as err:
+                raise LoginFailed("Failed to authenticate with Plex.tv") from err
+
+        try:
+            for resource in myplex_account.resources():
+
+                if "server" not in resource.provides:
+                    continue
+
+                # Match server by address/port
+                for conn in resource.connections:
+                    if (
+                        conn.address == local_server_ip
+                        and int(conn.port) == int(local_server_port)
+                    ):
+
+                        logging.getLogger("music_assistant.providers.plex").info(
+                            "Matched Plex resource '%s' (owned=%s)",
+                            resource.name,
+                            resource.owned,
+                        )
+                        # If owned use auth_token
+                        # If shared use resource.accessToken
+                        token = (
+                            auth_token if resource.owned else resource.accessToken
+                        )
+
+                        plex_server = PlexServer(
+                            f"{conn.protocol}://{conn.address}:{conn.port}",
+                            token=token,
+                            session=session,
+                        )
+                        break
+                if plex_server:
+                    break
+
+        except plexapi.exceptions.Unauthorized as err:
+            raise LoginFailed(f"Server {local_server_ip}:{local_server_port} not accessible in your Plex account") from err
+
+
+    # Local-only path
+    if auth_token == AUTH_TOKEN_UNAUTH:
+        # Local connection
+        plex_server = PlexServer(base_url, session=session)
+
+    if plex_server is None:
+        raise LoginFailed(f"Plex server {local_server_ip}:{local_server_port} not found")
+
+    return plex_server
 
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
@@ -296,113 +397,53 @@ async def get_config_entries(  # noqa: PLR0915
             required=True,
             depends_on=CONF_AUTH_TOKEN,
         )
-        conf_library_type = ConfigEntry(
-            key=CONF_LIBRARY_TYPE,
-            type=ConfigEntryType.STRING,
-            required=True,
-            depends_on=CONF_AUTH_TOKEN,
-            options=[
-                ConfigValueOption(LIBRARY_TYPE_MUSIC),
-                ConfigValueOption(LIBRARY_TYPE_AUDIOBOOKS),
-                ConfigValueOption(LIBRARY_TYPE_PODCASTS),
-            ],
-            default_value=LIBRARY_TYPE_MUSIC,
-        )
-
-        token = mass.config.decrypt_string(str(values.get(CONF_AUTH_TOKEN)))
-        server_http_ip = str(values.get(CONF_LOCAL_SERVER_IP))
-        server_http_port = str(values.get(CONF_LOCAL_SERVER_PORT, 32400))
-        server_http_ssl = bool(values.get(CONF_LOCAL_SERVER_SSL))
-        server_http_verify_cert = bool(values.get(CONF_LOCAL_SERVER_VERIFY_CERT))
-        sections = await get_section_info(
-            mass,
-            token,
-            server_http_ssl,
-            server_http_ip,
-            server_http_port,
-            server_http_verify_cert,
-            instance_id,
-        )
-        if not sections:
-            msg = (
-                "Unable to retrieve Servers and/or Music Libraries. "
-                "Please verify the local server IP and port are correct and the Plex server is running."
-            )
-            _LOGGER.warning(msg)
-        library_options = [
-            ConfigValueOption(title=s.display_name, value=s.display_name) for s in sections
-        ]
-        conf_libraries.options = library_options
-
-        # Determine which libraries are already claimed by other plex provider instances.
-        # We read raw stored config values directly (without include_values=True) to avoid
-        # recursively triggering get_config_entries for every plex instance.
-        used_libraries: set[str] = set()
-        has_audiobook_provider = False
-        raw_provs = mass.config.get("providers", {})
-        for prov_id, prov_conf in raw_provs.items():
-            if prov_conf.get("domain") != "plex":
-                continue
-            # Skip the current instance when editing so its own library isn't "used"
-            if prov_id == instance_id:
-                continue
-            prov_values = prov_conf.get("values", {})
-            if lib_val := prov_values.get(CONF_LIBRARY_ID):
-                used_libraries.add(str(lib_val))
-            if prov_values.get(CONF_LIBRARY_TYPE) == LIBRARY_TYPE_AUDIOBOOKS:
-                has_audiobook_provider = True
-
-        available_sections = [s for s in sections if s.display_name not in used_libraries]
-
-        # Only auto-select defaults if the user has not yet manually picked a library.
-        if not values.get(CONF_LIBRARY_ID):
-            # Sort: non-tracking first, then A-Z
-            sorted_available = sorted(
-                available_sections,
-                key=lambda s: (s.is_tracking_progress, s.display_name),
-            )
-            default_library = (
-                sorted_available[0].display_name
-                if sorted_available
-                else (
-                    available_sections[0].display_name
-                    if available_sections
-                    else (sections[0].display_name if sections else "")
-                )
+        if action in (
+            CONF_ACTION_LIBRARY,
+            CONF_ACTION_AUTH_MYPLEX,
+            CONF_ACTION_AUTH_LOCAL,
+        ):
+            token = mass.config.decrypt_string(str(values.get(CONF_AUTH_TOKEN)))
+            server_http_ip = str(values.get(CONF_LOCAL_SERVER_IP))
+            server_http_port = str(values.get(CONF_LOCAL_SERVER_PORT))
+            server_http_ssl = bool(values.get(CONF_LOCAL_SERVER_SSL))
+            server_http_verify_cert = bool(values.get(CONF_LOCAL_SERVER_VERIFY_CERT))
+            
+            # Fetch libraries
+            plex_server = await asyncio.to_thread(
+                resolve_plex_server,
+                local_server_ip=server_http_ip,
+                local_server_port=server_http_port,
+                local_server_ssl=server_http_ssl,
+                local_server_verify_cert=server_http_verify_cert,
+                auth_token=token,
+                myplex_account=None,
+                client_id=instance_id,
+                client_version=mass.version,
             )
 
-            # Determine default type from the selected library's tracking setting
-            selected_section = next(
-                (s for s in sections if s.display_name == default_library), None
+            # Fetch libraries
+            libraries = await get_libraries(
+                mass,
+                token,
+                server_http_ssl,
+                server_http_ip,
+                server_http_port,
+                server_http_verify_cert,
+                instance_id,
+                plex_server=plex_server,
             )
-            if selected_section and selected_section.is_tracking_progress:
-                default_type = (
-                    LIBRARY_TYPE_PODCASTS if has_audiobook_provider else LIBRARY_TYPE_AUDIOBOOKS
-                )
-            else:
-                default_type = LIBRARY_TYPE_MUSIC
-
-            conf_library_type.default_value = default_type
-            conf_library_type.value = default_type
-            conf_libraries.default_value = default_library
-            conf_libraries.value = default_library
-        else:
-            # Type may need updating if user changed the library
-            current_library = str(values.get(CONF_LIBRARY_ID, ""))
-            selected_section = next(
-                (s for s in sections if s.display_name == current_library), None
-            )
-            if selected_section and selected_section.is_tracking_progress:
-                suggested_type = (
-                    LIBRARY_TYPE_PODCASTS if has_audiobook_provider else LIBRARY_TYPE_AUDIOBOOKS
-                )
-            else:
-                suggested_type = LIBRARY_TYPE_MUSIC
-            current_type = values.get(CONF_LIBRARY_TYPE, suggested_type)
-            conf_library_type.default_value = suggested_type
-            conf_library_type.value = current_type
-            conf_libraries.value = current_library
-
+            if not libraries:
+                msg = "Unable to retrieve Servers and/or Music Libraries"
+                raise LoginFailed(msg)
+            conf_libraries.options = [
+                # use the same value for both the value and the title
+                # until we find out what plex uses as stable identifiers
+                ConfigValueOption(x, title=x)
+                for x in libraries
+            ]
+            # select first library as (default) value
+            conf_libraries.default_value = libraries[0]
+            conf_libraries.value = libraries[0]
         entries.append(conf_libraries)
         entries.append(conf_library_type)
 
@@ -534,72 +575,36 @@ class PlexProvider(MusicProvider):
 
     async def handle_async_init(self) -> None:
         """Set up the music provider by connecting to the server."""
-        # silence loggers
-        logging.getLogger("plexapi").setLevel(self.logger.level + 10)
+        # Parse library name
+        _, library_name = str(self.config.get_value(CONF_LIBRARY_ID)).split(" / ", 1)
 
-        library_name = extract_library_name(str(self.config.get_value(CONF_LIBRARY_ID)))
+        local_server_ip = self.config.get_value(CONF_LOCAL_SERVER_IP)
+        local_server_port = self.config.get_value(CONF_LOCAL_SERVER_PORT)
+        local_server_ssl = self.config.get_value(CONF_LOCAL_SERVER_SSL)
+        local_server_verify_cert = self.config.get_value(CONF_LOCAL_SERVER_VERIFY_CERT)
+        token = self.config.get_value(CONF_AUTH_TOKEN)
 
-        def connect() -> PlexServer:
-            try:
-                session = requests.Session()
-                session.verify = (
-                    bool(self.config.get_value(CONF_LOCAL_SERVER_VERIFY_CERT))
-                    if self.config.get_value(CONF_LOCAL_SERVER_SSL)
-                    else False
-                )
-                # Add Music Assistant client identification headers
-                session.headers.update(
-                    {
-                        "X-Plex-Client-Identifier": self.instance_id,
-                        "X-Plex-Product": "Music Assistant",
-                        "X-Plex-Platform": "Music Assistant",
-                        "X-Plex-Version": self.mass.version,
-                    }
-                )
-                local_server_protocol = (
-                    "https" if self.config.get_value(CONF_LOCAL_SERVER_SSL) else "http"
-                )
-                token = self.config.get_value(CONF_AUTH_TOKEN)
-                plex_url = (
-                    f"{local_server_protocol}://{self.config.get_value(CONF_LOCAL_SERVER_IP)}"
-                    f":{self.config.get_value(CONF_LOCAL_SERVER_PORT)}"
-                )
-                # silence urllib3 InsecureRequestWarning from Plex connections
-                # using wildcard certificates that don't validate against LAN IPs
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        "ignore",
-                        category=urllib3.exceptions.InsecureRequestWarning,
-                    )
-                    if token == AUTH_TOKEN_UNAUTH:
-                        # Doing local connection, not via plex.tv.
-                        plex_server = PlexServer(plex_url, session=session)
-                    else:
-                        plex_server = PlexServer(
-                            plex_url,
-                            token,
-                            session=session,
-                        )
-                # I don't think PlexAPI intends for this to be accessible, but we need it.
-                self._baseurl = plex_server._baseurl
+        # Get MyPlex account if token is not local auth
+        if token != AUTH_TOKEN_UNAUTH:
+            self._myplex_account = await self.get_myplex_account_and_refresh_token(str(token))
 
-            except plexapi.exceptions.BadRequest as err:
-                if "Invalid token" in str(err):
-                    # token invalid, invalidate the config
-                    self.mass.create_task(
-                        self.mass.config.remove_provider_config_value(
-                            self.instance_id, CONF_AUTH_TOKEN
-                        ),
-                    )
-                    raise LoginFailed(ERR_AUTH_FAILED)
-                raise LoginFailed from err
-            return plex_server
+        def connect():
 
-        self._myplex_account = await self.get_myplex_account_and_refresh_token(
-            str(self.config.get_value(CONF_AUTH_TOKEN))
-        )
+            return resolve_plex_server(
+                local_server_ip=local_server_ip,
+                local_server_port=local_server_port,
+                local_server_ssl=local_server_ssl,
+                local_server_verify_cert=local_server_verify_cert,
+                auth_token=token,
+                myplex_account=self._myplex_account,
+                client_id=self.instance_id,
+                client_version=self.mass.version,
+            )
+
         try:
             self._plex_server = await self._run_async(connect)
+            self._baseurl = self._plex_server._baseurl
+            # Select library
             self._plex_library = await self._run_async(
                 self._plex_server.library.section, library_name
             )
@@ -2275,3 +2280,60 @@ class PlexProvider(MusicProvider):
             can_seek=True,
             allow_seek=True,
         )
+
+        download_url = self._plex_server.url(f"{media_part.key}?download=1", True)
+
+        if content_type != ContentType.M4A:
+            stream_details.path = download_url
+            if audio_stream and audio_stream.samplingRate:
+                stream_details.audio_format.sample_rate = audio_stream.samplingRate
+            if audio_stream and audio_stream.bitDepth:
+                stream_details.audio_format.bit_depth = audio_stream.bitDepth
+
+        else:
+            media_info = await async_parse_tags(download_url)
+            stream_details.path = download_url
+            stream_details.audio_format.channels = media_info.channels
+            stream_details.audio_format.content_type = ContentType.try_parse(media_info.format)
+            stream_details.audio_format.sample_rate = media_info.sample_rate
+            stream_details.audio_format.bit_depth = media_info.bits_per_sample
+
+        return stream_details
+
+    async def get_myplex_account_and_refresh_token(self, auth_token: str) -> MyPlexAccount:
+        """Get a MyPlexAccount object and refresh the token if needed."""
+        if auth_token == AUTH_TOKEN_UNAUTH:
+            return self._myplex_account
+
+        def _refresh_plex_token() -> MyPlexAccount:
+            try:
+                if self._myplex_account is None:
+                    myplex_account = MyPlexAccount(token=auth_token)
+                    self._myplex_account = myplex_account
+                self._myplex_account.ping()
+                return self._myplex_account
+            except plexapi.exceptions.Unauthorized as err:
+                raise LoginFailed("Plex.tv authentication failed") from err
+
+        return await asyncio.to_thread(_refresh_plex_token)
+
+    async def set_favorite(self, prov_item_id: str, media_type: MediaType, favorite: bool) -> None:
+        """Set favorite status by setting rating in Plex."""
+        if favorite:
+            # Set like rating
+            rating = cast("float", self.config.get_value(CONF_PLEX_LIKE_RATING))
+        else:
+            # Set unlike rating
+            rating = cast("float", self.config.get_value(CONF_PLEX_UNLIKE_RATING))
+
+        if media_type == MediaType.TRACK:
+            plex_item: PlexTrack | PlexAlbum = await self._get_data(prov_item_id, PlexTrack)
+        elif media_type == MediaType.ALBUM:
+            plex_album = await self._get_data(prov_item_id, PlexAlbum)
+            await self._run_async(plex_album.rate, rating)
+            self.logger.debug(
+                "Set Plex rating to %s for album with ID %s (ratingKey: %s)",
+                rating,
+                prov_item_id,
+                plex_album.ratingKey,
+            )
