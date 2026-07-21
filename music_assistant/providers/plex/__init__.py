@@ -397,53 +397,128 @@ async def get_config_entries(  # noqa: PLR0915
             required=True,
             depends_on=CONF_AUTH_TOKEN,
         )
-        if action in (
-            CONF_ACTION_LIBRARY,
-            CONF_ACTION_AUTH_MYPLEX,
-            CONF_ACTION_AUTH_LOCAL,
-        ):
-            token = mass.config.decrypt_string(str(values.get(CONF_AUTH_TOKEN)))
-            server_http_ip = str(values.get(CONF_LOCAL_SERVER_IP))
-            server_http_port = str(values.get(CONF_LOCAL_SERVER_PORT))
-            server_http_ssl = bool(values.get(CONF_LOCAL_SERVER_SSL))
-            server_http_verify_cert = bool(values.get(CONF_LOCAL_SERVER_VERIFY_CERT))
-            
-            # Fetch libraries
-            plex_server = await asyncio.to_thread(
-                resolve_plex_server,
-                local_server_ip=server_http_ip,
-                local_server_port=server_http_port,
-                local_server_ssl=server_http_ssl,
-                local_server_verify_cert=server_http_verify_cert,
-                auth_token=token,
-                myplex_account=None,
-                client_id=instance_id,
-                client_version=mass.version,
+        conf_library_type = ConfigEntry(
+            key=CONF_LIBRARY_TYPE,
+            type=ConfigEntryType.STRING,
+            required=True,
+            depends_on=CONF_AUTH_TOKEN,
+            options=[
+                ConfigValueOption(LIBRARY_TYPE_MUSIC),
+                ConfigValueOption(LIBRARY_TYPE_AUDIOBOOKS),
+                ConfigValueOption(LIBRARY_TYPE_PODCASTS),
+            ],
+            default_value=LIBRARY_TYPE_MUSIC,
+        )
+
+        token = mass.config.decrypt_string(str(values.get(CONF_AUTH_TOKEN)))
+        server_http_ip = str(values.get(CONF_LOCAL_SERVER_IP))
+        server_http_port = str(values.get(CONF_LOCAL_SERVER_PORT, 32400))
+        server_http_ssl = bool(values.get(CONF_LOCAL_SERVER_SSL))
+        server_http_verify_cert = bool(values.get(CONF_LOCAL_SERVER_VERIFY_CERT))
+
+        # Fetch libraries
+        plex_server = await asyncio.to_thread(
+            resolve_plex_server,
+            local_server_ip=server_http_ip,
+            local_server_port=server_http_port,
+            local_server_ssl=server_http_ssl,
+            local_server_verify_cert=server_http_verify_cert,
+            auth_token=token,
+            myplex_account=None,
+            client_id=instance_id,
+            client_version=mass.version,
+        )
+
+        sections = await get_section_info(
+            mass,
+            token,
+            server_http_ssl,
+            server_http_ip,
+            server_http_port,
+            server_http_verify_cert,
+            instance_id,
+            plex_server=plex_server,
+        )
+        if not sections:
+            msg = (
+                "Unable to retrieve Servers and/or Music Libraries. "
+                "Please verify the local server IP and port are correct and the Plex server is running."
+            )
+            _LOGGER.warning(msg)
+        library_options = [
+            ConfigValueOption(title=s.display_name, value=s.display_name) for s in sections
+        ]
+        conf_libraries.options = library_options
+
+        # Determine which libraries are already claimed by other plex provider instances.
+        # We read raw stored config values directly (without include_values=True) to avoid
+        # recursively triggering get_config_entries for every plex instance.
+        used_libraries: set[str] = set()
+        has_audiobook_provider = False
+        raw_provs = mass.config.get("providers", {})
+        for prov_id, prov_conf in raw_provs.items():
+            if prov_conf.get("domain") != "plex":
+                continue
+            # Skip the current instance when editing so its own library isn't "used"
+            if prov_id == instance_id:
+                continue
+            prov_values = prov_conf.get("values", {})
+            if lib_val := prov_values.get(CONF_LIBRARY_ID):
+                used_libraries.add(str(lib_val))
+            if prov_values.get(CONF_LIBRARY_TYPE) == LIBRARY_TYPE_AUDIOBOOKS:
+                has_audiobook_provider = True
+
+        available_sections = [s for s in sections if s.display_name not in used_libraries]
+
+        # Only auto-select defaults if the user has not yet manually picked a library.
+        if not values.get(CONF_LIBRARY_ID):
+            # Sort: non-tracking first, then A-Z
+            sorted_available = sorted(
+                available_sections,
+                key=lambda s: (s.is_tracking_progress, s.display_name),
+            )
+            default_library = (
+                sorted_available[0].display_name
+                if sorted_available
+                else (
+                    available_sections[0].display_name
+                    if available_sections
+                    else (sections[0].display_name if sections else "")
+                )
             )
 
-            # Fetch libraries
-            libraries = await get_libraries(
-                mass,
-                token,
-                server_http_ssl,
-                server_http_ip,
-                server_http_port,
-                server_http_verify_cert,
-                instance_id,
-                plex_server=plex_server,
+            # Determine default type from the selected library's tracking setting
+            selected_section = next(
+                (s for s in sections if s.display_name == default_library), None
             )
-            if not libraries:
-                msg = "Unable to retrieve Servers and/or Music Libraries"
-                raise LoginFailed(msg)
-            conf_libraries.options = [
-                # use the same value for both the value and the title
-                # until we find out what plex uses as stable identifiers
-                ConfigValueOption(x, title=x)
-                for x in libraries
-            ]
-            # select first library as (default) value
-            conf_libraries.default_value = libraries[0]
-            conf_libraries.value = libraries[0]
+            if selected_section and selected_section.is_tracking_progress:
+                default_type = (
+                    LIBRARY_TYPE_PODCASTS if has_audiobook_provider else LIBRARY_TYPE_AUDIOBOOKS
+                )
+            else:
+                default_type = LIBRARY_TYPE_MUSIC
+
+            conf_library_type.default_value = default_type
+            conf_library_type.value = default_type
+            conf_libraries.default_value = default_library
+            conf_libraries.value = default_library
+        else:
+            # Type may need updating if user changed the library
+            current_library = str(values.get(CONF_LIBRARY_ID, ""))
+            selected_section = next(
+                (s for s in sections if s.display_name == current_library), None
+            )
+            if selected_section and selected_section.is_tracking_progress:
+                suggested_type = (
+                    LIBRARY_TYPE_PODCASTS if has_audiobook_provider else LIBRARY_TYPE_AUDIOBOOKS
+                )
+            else:
+                suggested_type = LIBRARY_TYPE_MUSIC
+            current_type = values.get(CONF_LIBRARY_TYPE, suggested_type)
+            conf_library_type.default_value = suggested_type
+            conf_library_type.value = current_type
+            conf_libraries.value = current_library
+
         entries.append(conf_libraries)
         entries.append(conf_library_type)
 
@@ -575,8 +650,10 @@ class PlexProvider(MusicProvider):
 
     async def handle_async_init(self) -> None:
         """Set up the music provider by connecting to the server."""
-        # Parse library name
-        _, library_name = str(self.config.get_value(CONF_LIBRARY_ID)).split(" / ", 1)
+        # silence loggers
+        logging.getLogger("plexapi").setLevel(self.logger.level + 10)
+
+        library_name = extract_library_name(str(self.config.get_value(CONF_LIBRARY_ID)))
 
         local_server_ip = self.config.get_value(CONF_LOCAL_SERVER_IP)
         local_server_port = self.config.get_value(CONF_LOCAL_SERVER_PORT)
@@ -2280,60 +2357,3 @@ class PlexProvider(MusicProvider):
             can_seek=True,
             allow_seek=True,
         )
-
-        download_url = self._plex_server.url(f"{media_part.key}?download=1", True)
-
-        if content_type != ContentType.M4A:
-            stream_details.path = download_url
-            if audio_stream and audio_stream.samplingRate:
-                stream_details.audio_format.sample_rate = audio_stream.samplingRate
-            if audio_stream and audio_stream.bitDepth:
-                stream_details.audio_format.bit_depth = audio_stream.bitDepth
-
-        else:
-            media_info = await async_parse_tags(download_url)
-            stream_details.path = download_url
-            stream_details.audio_format.channels = media_info.channels
-            stream_details.audio_format.content_type = ContentType.try_parse(media_info.format)
-            stream_details.audio_format.sample_rate = media_info.sample_rate
-            stream_details.audio_format.bit_depth = media_info.bits_per_sample
-
-        return stream_details
-
-    async def get_myplex_account_and_refresh_token(self, auth_token: str) -> MyPlexAccount:
-        """Get a MyPlexAccount object and refresh the token if needed."""
-        if auth_token == AUTH_TOKEN_UNAUTH:
-            return self._myplex_account
-
-        def _refresh_plex_token() -> MyPlexAccount:
-            try:
-                if self._myplex_account is None:
-                    myplex_account = MyPlexAccount(token=auth_token)
-                    self._myplex_account = myplex_account
-                self._myplex_account.ping()
-                return self._myplex_account
-            except plexapi.exceptions.Unauthorized as err:
-                raise LoginFailed("Plex.tv authentication failed") from err
-
-        return await asyncio.to_thread(_refresh_plex_token)
-
-    async def set_favorite(self, prov_item_id: str, media_type: MediaType, favorite: bool) -> None:
-        """Set favorite status by setting rating in Plex."""
-        if favorite:
-            # Set like rating
-            rating = cast("float", self.config.get_value(CONF_PLEX_LIKE_RATING))
-        else:
-            # Set unlike rating
-            rating = cast("float", self.config.get_value(CONF_PLEX_UNLIKE_RATING))
-
-        if media_type == MediaType.TRACK:
-            plex_item: PlexTrack | PlexAlbum = await self._get_data(prov_item_id, PlexTrack)
-        elif media_type == MediaType.ALBUM:
-            plex_album = await self._get_data(prov_item_id, PlexAlbum)
-            await self._run_async(plex_album.rate, rating)
-            self.logger.debug(
-                "Set Plex rating to %s for album with ID %s (ratingKey: %s)",
-                rating,
-                prov_item_id,
-                plex_album.ratingKey,
-            )
