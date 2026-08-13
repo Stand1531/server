@@ -2,15 +2,21 @@
 
 import asyncio
 import base64
-from collections.abc import Callable
-from typing import cast
-from unittest.mock import AsyncMock, Mock, patch
+import hashlib
+import json
+import logging
+from collections.abc import AsyncIterator, Callable, Coroutine
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from urllib.parse import urlparse
 
+import aiohttp
 import pytest
-from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection
-from aiortc.rtcdtlstransport import RTCCertificate
+from aiolibdatachannel import DataChannel, IceServer, LogLevel, PeerConnection, RTCConfiguration
+from cryptography.hazmat.primitives import serialization
 
+from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.controllers.webserver.remote_access import (
     STARTUP_DELAY,
     TASK_ID_START_GATEWAY,
@@ -18,28 +24,15 @@ from music_assistant.controllers.webserver.remote_access import (
     RemoteAccessManager,
 )
 from music_assistant.controllers.webserver.remote_access.gateway import (
+    MA_API_CHUNK_SIZE,
     WebRTCGateway,
     WebRTCSession,
+    _is_usable_ice_url,
 )
 from music_assistant.helpers.webrtc_certificate import (
     _generate_certificate,
     _remote_id_from_certificate,
-    create_peer_connection_with_certificate,
 )
-
-
-@pytest.fixture
-def mock_certificate() -> Mock:
-    """Create a mock RTCCertificate for testing."""
-    cert = Mock()
-    mock_fingerprint = Mock()
-    mock_fingerprint.algorithm = "sha-256"
-    mock_fingerprint.value = (
-        "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:"
-        "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
-    )
-    cert.getFingerprints.return_value = [mock_fingerprint]
-    return cert
 
 
 async def test_remote_id_from_certificate() -> None:
@@ -54,20 +47,6 @@ async def test_remote_id_from_certificate() -> None:
     assert len(remote_id) == 26
     # deterministic: the same certificate always yields the same id
     assert _remote_id_from_certificate(cert) == remote_id
-
-
-async def test_remote_id_matches_aiortc_fingerprint() -> None:
-    """The aiortc-free remote ID must match aiortc's own certificate fingerprint derivation."""
-    private_key, cert = _generate_certificate()
-    rtc_cert = RTCCertificate(key=private_key, cert=cert)
-    fingerprint = next(fp.value for fp in rtc_cert.getFingerprints() if fp.algorithm == "sha-256")
-    expected = (
-        base64.b32encode(bytes.fromhex(fingerprint.replace(":", ""))[:16])
-        .decode("ascii")
-        .rstrip("=")
-        .replace("2", "9")
-    )
-    assert _remote_id_from_certificate(cert) == expected
 
 
 async def test_remote_access_info_dataclass() -> None:
@@ -211,13 +190,74 @@ async def test_remote_access_skips_restart_after_mode_flap_settles() -> None:
     assert manager._target_using_ha_cloud is False
 
 
-async def test_webrtc_gateway_initialization(mock_certificate: Mock) -> None:
+async def test_remote_access_gateway_uses_internal_sendspin_url(
+    cert_pems: tuple[str, str],
+) -> None:
+    """Bridge the Sendspin data channel to the locally reachable Sendspin server."""
+    internal_url = "ws://127.0.0.1:8927/sendspin"
+    manager = _create_remote_access_manager()
+    manager._remote_id = "TEST-REMOTE-ID"
+    cast("Mock", manager.webserver).internal_base_url = "http://127.0.0.1:8095"
+    cast("Mock", manager.webserver).internal_sendspin_url = internal_url
+
+    with (
+        patch(
+            "music_assistant.controllers.webserver.remote_access"
+            ".get_or_create_webrtc_certificate_pems",
+            return_value=cert_pems,
+        ),
+        patch.object(manager, "_get_ha_cloud_status", new=AsyncMock(return_value=(False, None))),
+        patch.object(WebRTCGateway, "start", new=AsyncMock()),
+    ):
+        await manager._start_gateway_locked()
+
+    assert manager.gateway is not None
+    assert manager.gateway.sendspin_url == internal_url
+
+
+@pytest.mark.parametrize(
+    ("internal_base_url", "expected"),
+    [
+        ("http://127.0.0.1:8095", "ws://127.0.0.1:8095/ws"),
+        ("https://127.0.0.1:8095", "wss://127.0.0.1:8095/ws"),
+    ],
+)
+async def test_remote_access_gateway_uses_internal_base_url(
+    cert_pems: tuple[str, str],
+    internal_base_url: str,
+    expected: str,
+) -> None:
+    """Bridge the API data channel to the locally reachable webserver."""
+    manager = _create_remote_access_manager()
+    manager._remote_id = "TEST-REMOTE-ID"
+    # an external base URL must never be dialed back into this host
+    cast("Mock", manager.mass).webserver.base_url = "https://ma.example.com"
+    cast("Mock", manager.webserver).internal_base_url = internal_base_url
+
+    with (
+        patch(
+            "music_assistant.controllers.webserver.remote_access"
+            ".get_or_create_webrtc_certificate_pems",
+            return_value=cert_pems,
+        ),
+        patch.object(manager, "_get_ha_cloud_status", new=AsyncMock(return_value=(False, None))),
+        patch.object(WebRTCGateway, "start", new=AsyncMock()),
+    ):
+        await manager._start_gateway_locked()
+
+    assert manager.gateway is not None
+    assert manager.gateway.local_ws_url == expected
+
+
+async def test_webrtc_gateway_initialization(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway initializes correctly."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
         signaling_url="wss://test.example.com/ws",
         local_ws_url="ws://localhost:8095/ws",
     )
@@ -230,8 +270,9 @@ async def test_webrtc_gateway_initialization(mock_certificate: Mock) -> None:
     assert len(gateway.ice_servers) > 0
 
 
-async def test_webrtc_gateway_custom_ice_servers(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_custom_ice_servers(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway accepts custom ICE servers."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     custom_ice_servers = [
         {"urls": "stun:custom.stun.server:3478"},
@@ -241,20 +282,75 @@ async def test_webrtc_gateway_custom_ice_servers(mock_certificate: Mock) -> None
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
         ice_servers=custom_ice_servers,
     )
 
     assert gateway.ice_servers == custom_ice_servers
 
 
-async def test_webrtc_gateway_start_stop(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_local_ice_servers_skip_non_udp_turn(
+    cert_pems: tuple[str, str],
+) -> None:
+    """Test the local peer connection only gets ICE servers libjuice can use."""
+    cert_pem, key_pem = cert_pems
+    cred = {"username": "u", "credential": "p"}
+    # shape of what HA Cloud hands us: one UDP TURN url plus TCP/TLS variants
+    ha_cloud_ice_servers = [
+        {"urls": "stun:stun.cloudflare.com:3478"},
+        {"urls": "turn:turn.cloudflare.com:3478?transport=udp", **cred},
+        {"urls": "turn:turn.cloudflare.com:53", **cred},
+        {"urls": "turn:turn.cloudflare.com:3478?transport=tcp", **cred},
+        {"urls": "turns:turn.cloudflare.com:5349?transport=tcp", **cred},
+        {"urls": "turns:turn.cloudflare.com:443?transport=tcp", **cred},
+    ]
+
+    gateway = WebRTCGateway(
+        http_session=Mock(),
+        remote_id="TEST-REMOTE-ID",
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+        ice_servers=ha_cloud_ice_servers,
+    )
+
+    assert [server.url for server in gateway._build_ice_servers(ha_cloud_ice_servers)] == [
+        "stun:stun.cloudflare.com:3478",
+        "turn:turn.cloudflare.com:3478?transport=udp",
+        "turn:turn.cloudflare.com:53",
+    ]
+    # remote clients still get the unfiltered list, since browsers do support TCP/TLS TURN
+    assert gateway.ice_servers == ha_cloud_ice_servers
+
+
+@pytest.mark.parametrize(
+    ("url", "usable"),
+    [
+        ("stun:stun.example.com:3478", True),
+        ("turn:turn.example.com:3478", True),
+        ("turn:turn.example.com:3478?transport=udp", True),
+        # the transport parameter wins over the scheme, matching rtc::IceServer
+        ("turns:turn.example.com:5349?transport=udp", True),
+        ("turn:turn.example.com:3478?transport=tcp", False),
+        ("turns:turn.example.com:5349", False),
+        ("turn:turn.example.com:3478?transport=tls", False),
+        ("https://turn.example.com", False),
+    ],
+)
+def test_is_usable_ice_url(url: str, usable: bool) -> None:
+    """Test only ICE server urls libjuice can actually use are kept."""
+    assert _is_usable_ice_url(url) is usable
+
+
+async def test_webrtc_gateway_start_stop(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway start and stop."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
     # Mock the _run method to avoid actual connection
@@ -267,13 +363,84 @@ async def test_webrtc_gateway_start_stop(mock_certificate: Mock) -> None:
         assert gateway.is_running is False
 
 
-async def test_webrtc_gateway_handle_registration_message(mock_certificate: Mock) -> None:
+@pytest.mark.parametrize(
+    ("logger_level", "expected_rtc_level"),
+    [
+        (VERBOSE_LOG_LEVEL, LogLevel.VERBOSE),
+        (logging.DEBUG, LogLevel.WARNING),
+        (logging.INFO, LogLevel.ERROR),
+        (logging.WARNING, LogLevel.ERROR),
+    ],
+)
+async def test_webrtc_gateway_native_log_level(
+    cert_pems: tuple[str, str], logger_level: int, expected_rtc_level: LogLevel
+) -> None:
+    """Test native libdatachannel logging is capped at ERROR unless debugging."""
+    cert_pem, key_pem = cert_pems
+    gateway = WebRTCGateway(
+        http_session=Mock(),
+        remote_id="TEST-REMOTE-ID",
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+    )
+    gateway.logger = logging.getLogger("test_webrtc_native_log_level")
+    gateway.logger.setLevel(logger_level)
+
+    with (
+        patch.object(gateway, "_run", new_callable=AsyncMock),
+        patch(
+            "music_assistant.controllers.webserver.remote_access.gateway.install_python_logger"
+        ) as install_logger,
+    ):
+        await gateway.start()
+        await gateway.stop()
+
+    install_logger.assert_called_once_with(gateway.logger, level=expected_rtc_level)
+    assert not gateway.logger.filters
+
+
+async def test_webrtc_gateway_drops_benign_turn_warning_at_debug(
+    cert_pems: tuple[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test the benign Cloudflare CreatePermission warning is dropped at DEBUG level."""
+    cert_pem, key_pem = cert_pems
+    gateway = WebRTCGateway(
+        http_session=Mock(),
+        remote_id="TEST-REMOTE-ID",
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+    )
+    gateway.logger = logging.getLogger("test_webrtc_benign_turn_warning")
+    gateway.logger.setLevel(logging.DEBUG)
+
+    with (
+        patch.object(gateway, "_run", new_callable=AsyncMock),
+        patch("music_assistant.controllers.webserver.remote_access.gateway.install_python_logger"),
+    ):
+        await gateway.start()
+        with caplog.at_level(logging.DEBUG, logger="test_webrtc_benign_turn_warning"):
+            gateway.logger.warning(
+                "rtc::impl::IceTransport::LogCallback@390: "
+                "juice: Got TURN CreatePermission error response, code=0"
+            )
+            gateway.logger.warning("juice: Lost connectivity")
+        await gateway.stop()
+
+    messages = [record.getMessage() for record in caplog.records if "juice" in record.getMessage()]
+    assert messages == ["juice: Lost connectivity"]
+    # stop() must remove the filter again
+    assert not gateway.logger.filters
+
+
+async def test_webrtc_gateway_handle_registration_message(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway handles registration confirmation."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
     # Mock signaling WebSocket
@@ -285,13 +452,15 @@ async def test_webrtc_gateway_handle_registration_message(mock_certificate: Mock
     # Should log but not crash
 
 
-async def test_webrtc_gateway_handle_error_message(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_handle_error_message(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway handles error messages."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
     message = {"type": "error", "message": "Test error"}
@@ -299,63 +468,73 @@ async def test_webrtc_gateway_handle_error_message(mock_certificate: Mock) -> No
     await gateway._handle_signaling_message(message)
 
 
-async def test_webrtc_gateway_create_session(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_create_session(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway creates sessions for clients."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
     session_id = "test-session-123"
-    await gateway._create_session(session_id)
+    with patch.object(gateway, "_get_fresh_ice_servers", AsyncMock(return_value=[])):
+        await gateway._create_session(session_id)
 
-    assert session_id in gateway.sessions
-    assert gateway.sessions[session_id].session_id == session_id
-    assert gateway.sessions[session_id].peer_connection is not None
+        assert session_id in gateway.sessions
+        assert gateway.sessions[session_id].session_id == session_id
+        assert gateway.sessions[session_id].pc is not None
 
-    # Cleanup
-    await gateway._close_session(session_id)
+        # Cleanup
+        await gateway._close_session(session_id)
 
 
-async def test_webrtc_gateway_close_session(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_close_session(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway closes sessions properly."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
     session_id = "test-session-456"
-    await gateway._create_session(session_id)
-    assert session_id in gateway.sessions
+    with patch.object(gateway, "_get_fresh_ice_servers", AsyncMock(return_value=[])):
+        await gateway._create_session(session_id)
+        assert session_id in gateway.sessions
 
-    await gateway._close_session(session_id)
-    assert session_id not in gateway.sessions
+        await gateway._close_session(session_id)
+        assert session_id not in gateway.sessions
 
 
-async def test_webrtc_gateway_close_nonexistent_session(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_close_nonexistent_session(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway handles closing non-existent session gracefully."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
     # Should not raise an error
     await gateway._close_session("nonexistent-session")
 
 
-async def test_webrtc_gateway_default_ice_servers(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_default_ice_servers(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway uses default ICE servers."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
     assert len(gateway.ice_servers) > 0
@@ -363,352 +542,62 @@ async def test_webrtc_gateway_default_ice_servers(mock_certificate: Mock) -> Non
     assert any("stun:" in server["urls"] for server in gateway.ice_servers)
 
 
-async def test_webrtc_gateway_handle_client_connected(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_handle_client_connected(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway handles client-connected message."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
-    message = {"type": "client-connected", "sessionId": "test-session"}
-    await gateway._handle_signaling_message(message)
+    with patch.object(gateway, "_get_fresh_ice_servers", AsyncMock(return_value=[])):
+        message = {"type": "client-connected", "sessionId": "test-session"}
+        await gateway._handle_signaling_message(message)
 
-    # Session should be created
-    assert "test-session" in gateway.sessions
+        # Session should be created
+        assert "test-session" in gateway.sessions
 
-    # Cleanup
-    await gateway._close_session("test-session")
+        # Cleanup
+        await gateway._close_session("test-session")
 
 
-async def test_webrtc_gateway_handle_client_disconnected(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_handle_client_disconnected(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway handles client-disconnected message."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
-    # Create a session first
-    session_id = "test-disconnect-session"
-    await gateway._create_session(session_id)
-    assert session_id in gateway.sessions
+    with patch.object(gateway, "_get_fresh_ice_servers", AsyncMock(return_value=[])):
+        # Create a session first
+        session_id = "test-disconnect-session"
+        await gateway._create_session(session_id)
+        assert session_id in gateway.sessions
 
-    # Handle disconnect
-    message = {"type": "client-disconnected", "sessionId": session_id}
-    await gateway._handle_signaling_message(message)
+        # Handle disconnect
+        message = {"type": "client-disconnected", "sessionId": session_id}
+        await gateway._handle_signaling_message(message)
 
-    # Session should be removed
-    assert session_id not in gateway.sessions
-
-
-async def test_sendspin_handler_queues_message_before_setup_runs(
-    mock_certificate: Mock,
-) -> None:
-    """Queue the first Sendspin message as soon as its data channel is announced."""
-    gateway = WebRTCGateway(
-        http_session=Mock(),
-        remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
-    )
-    session_id = "sendspin-session"
-    await gateway._create_session(session_id)
-    session = gateway.sessions[session_id]
-    callbacks: dict[str, Callable[..., None]] = {}
-    channel = Mock()
-    channel.label = "sendspin"
-
-    def register_callback(
-        event: str,
-    ) -> Callable[[Callable[..., None]], Callable[..., None]]:
-        def decorator(callback: Callable[..., None]) -> Callable[..., None]:
-            callbacks[event] = callback
-            return callback
-
-        return decorator
-
-    channel.on.side_effect = register_callback
-
-    try:
-        with patch.object(gateway, "_setup_sendspin_channel", new=AsyncMock()):
-            session.peer_connection.emit("datachannel", channel)
-            message = '{"type":"auth","client_id":"web-player"}'
-            callbacks["message"](message)
-            await asyncio.sleep(0)
-            assert session.sendspin_queue.get_nowait() == message
-    finally:
-        await gateway._close_session(session_id)
+        # Session should be removed
+        assert session_id not in gateway.sessions
 
 
-async def test_api_handler_queues_message_before_setup_runs(
-    mock_certificate: Mock,
-) -> None:
-    """Queue the first API message as soon as its data channel is announced."""
-    gateway = WebRTCGateway(
-        http_session=Mock(),
-        remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
-    )
-    session_id = "api-session"
-    await gateway._create_session(session_id)
-    session = gateway.sessions[session_id]
-    callbacks: dict[str, Callable[..., None]] = {}
-    channel = Mock()
-    channel.label = "ma-api"
-
-    def register_callback(
-        event: str,
-    ) -> Callable[[Callable[..., None]], Callable[..., None]]:
-        def decorator(callback: Callable[..., None]) -> Callable[..., None]:
-            callbacks[event] = callback
-            return callback
-
-        return decorator
-
-    channel.on.side_effect = register_callback
-
-    try:
-        with patch.object(gateway, "_setup_data_channel", new=AsyncMock()):
-            session.peer_connection.emit("datachannel", channel)
-            message = '{"command":"server/info"}'
-            callbacks["message"](message)
-            await asyncio.sleep(0)
-            assert session.message_queue.get_nowait() == message
-    finally:
-        await gateway._close_session(session_id)
-
-
-async def test_sendspin_setup_failure_stops_accepting_messages(
-    mock_certificate: Mock,
-) -> None:
-    """Drop queued and future messages when the internal audio bridge cannot connect."""
-    http_session = Mock()
-    http_session.ws_connect = AsyncMock(side_effect=RuntimeError("connection failed"))
-    gateway = WebRTCGateway(
-        http_session=http_session,
-        remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
-    )
-    session = WebRTCSession(session_id="sendspin-session", peer_connection=Mock())
-    callbacks: dict[str, Callable[..., None]] = {}
-    channel = Mock()
-    session.sendspin_channel = channel
-    session.sendspin_channel_active = True
-
-    def register_callback(
-        event: str,
-    ) -> Callable[[Callable[..., None]], Callable[..., None]]:
-        def decorator(callback: Callable[..., None]) -> Callable[..., None]:
-            callbacks[event] = callback
-            return callback
-
-        return decorator
-
-    channel.on.side_effect = register_callback
-    gateway._register_sendspin_channel_handlers(session)
-    callbacks["message"]("queued before setup")
-    await asyncio.sleep(0)
-    assert session.sendspin_queue.qsize() == 1
-
-    await gateway._setup_sendspin_channel(session)
-    callbacks["message"]("sent after failure")
-    await asyncio.sleep(0)
-
-    assert session.sendspin_channel_active is False
-    assert session.sendspin_queue.empty()
-    channel.close.assert_called_once_with()
-
-
-async def test_sendspin_close_during_setup_closes_internal_bridge(
-    mock_certificate: Mock,
-) -> None:
-    """Close a late internal bridge when its remote data channel is already gone."""
-    connect_started = asyncio.Event()
-    allow_connect = asyncio.Event()
-    internal_ws = AsyncMock()
-    internal_ws.closed = False
-
-    async def connect_internal(_url: str) -> AsyncMock:
-        connect_started.set()
-        await allow_connect.wait()
-        return internal_ws
-
-    http_session = Mock()
-    http_session.ws_connect = AsyncMock(side_effect=connect_internal)
-    gateway = WebRTCGateway(
-        http_session=http_session,
-        remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
-    )
-    session = WebRTCSession(session_id="sendspin-session", peer_connection=Mock())
-    callbacks: dict[str, Callable[..., None]] = {}
-    channel = Mock()
-    session.sendspin_channel = channel
-    session.sendspin_channel_active = True
-
-    def register_callback(
-        event: str,
-    ) -> Callable[[Callable[..., None]], Callable[..., None]]:
-        def decorator(callback: Callable[..., None]) -> Callable[..., None]:
-            callbacks[event] = callback
-            return callback
-
-        return decorator
-
-    channel.on.side_effect = register_callback
-    gateway._register_sendspin_channel_handlers(session)
-
-    setup_task = asyncio.create_task(gateway._setup_sendspin_channel(session))
-    await connect_started.wait()
-    callbacks["close"]()
-    allow_connect.set()
-    await setup_task
-
-    internal_ws.close.assert_awaited_once_with()
-    assert session.sendspin_ws is None
-    assert session.sendspin_to_local_task is None
-    assert session.sendspin_from_local_task is None
-
-
-async def test_sendspin_channel_close_cleans_forwarding_tasks(
-    mock_certificate: Mock,
-) -> None:
-    """Cancel forwarding tasks when the remote audio data channel closes."""
-    gateway = WebRTCGateway(
-        http_session=Mock(),
-        remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
-    )
-    session = WebRTCSession(session_id="sendspin-session", peer_connection=Mock())
-    gateway.sessions[session.session_id] = session
-    callbacks: dict[str, Callable[..., None]] = {}
-    channel = Mock()
-    session.sendspin_channel = channel
-    session.sendspin_channel_active = True
-    sendspin_ws = AsyncMock()
-    sendspin_ws.closed = False
-    session.sendspin_ws = sendspin_ws
-
-    async def wait_forever() -> None:
-        await asyncio.Event().wait()
-
-    to_local = asyncio.create_task(wait_forever())
-    from_local = asyncio.create_task(wait_forever())
-    session.sendspin_to_local_task = to_local
-    session.sendspin_from_local_task = from_local
-
-    def register_callback(
-        event: str,
-    ) -> Callable[[Callable[..., None]], Callable[..., None]]:
-        def decorator(callback: Callable[..., None]) -> Callable[..., None]:
-            callbacks[event] = callback
-            return callback
-
-        return decorator
-
-    channel.on.side_effect = register_callback
-    gateway._register_sendspin_channel_handlers(session)
-    callbacks["close"]()
-    for _ in range(20):
-        await asyncio.sleep(0)
-        if to_local.done() and from_local.done() and not gateway._background_tasks:
-            break
-
-    assert session.sendspin_channel_active is False
-    assert to_local.cancelled()
-    assert from_local.cancelled()
-    assert vars(session)["sendspin_to_local_task"] is None
-    assert vars(session)["sendspin_from_local_task"] is None
-    assert session.sendspin_ws is None
-    sendspin_ws.close.assert_awaited_once_with()
-    gateway.sessions.pop(session.session_id)
-
-
-async def test_sendspin_session_close_cancels_inflight_setup(
-    mock_certificate: Mock,
-) -> None:
-    """Cancel a pending internal audio connection before closing its WebRTC session."""
-    connect_started = asyncio.Event()
-
-    async def connect_internal(_url: str) -> None:
-        connect_started.set()
-        await asyncio.Event().wait()
-
-    http_session = Mock()
-    http_session.ws_connect = AsyncMock(side_effect=connect_internal)
-    gateway = WebRTCGateway(
-        http_session=http_session,
-        remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
-    )
-    peer_connection = Mock()
-    peer_connection.close = AsyncMock()
-    session = WebRTCSession(
-        session_id="sendspin-session",
-        peer_connection=peer_connection,
-    )
-    session.sendspin_channel = Mock()
-    session.sendspin_channel_active = True
-    setup_task = asyncio.create_task(gateway._setup_sendspin_channel(session))
-    session.sendspin_setup_task = setup_task
-    gateway.sessions[session.session_id] = session
-    await connect_started.wait()
-
-    await gateway._close_session(session.session_id)
-
-    assert setup_task.cancelled()
-    assert vars(session)["sendspin_setup_task"] is None
-    assert session.session_id not in vars(gateway)["sessions"]
-    peer_connection.close.assert_awaited_once_with()
-
-
-async def test_api_session_close_cancels_inflight_setup(
-    mock_certificate: Mock,
-) -> None:
-    """Cancel a pending local API connection before closing its WebRTC session."""
-    connect_started = asyncio.Event()
-
-    async def connect_local(_url: str) -> None:
-        connect_started.set()
-        await asyncio.Event().wait()
-
-    http_session = Mock()
-    http_session.ws_connect = AsyncMock(side_effect=connect_local)
-    gateway = WebRTCGateway(
-        http_session=http_session,
-        remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
-    )
-    peer_connection = Mock()
-    peer_connection.close = AsyncMock()
-    session = WebRTCSession(
-        session_id="api-session",
-        peer_connection=peer_connection,
-    )
-    session.data_channel = Mock()
-    session.data_channel_active = True
-    setup_task = asyncio.create_task(gateway._setup_data_channel(session))
-    session.data_channel_setup_task = setup_task
-    gateway.sessions[session.session_id] = session
-    await connect_started.wait()
-
-    await gateway._close_session(session.session_id)
-
-    assert setup_task.cancelled()
-    assert vars(session)["data_channel_setup_task"] is None
-    assert session.session_id not in vars(gateway)["sessions"]
-    peer_connection.close.assert_awaited_once_with()
-
-
-async def test_webrtc_gateway_reconnection_logic(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_reconnection_logic(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway has proper reconnection backoff."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
     # Check initial reconnect delay
@@ -731,32 +620,15 @@ async def test_webrtc_gateway_reconnection_logic(mock_certificate: Mock) -> None
     assert gateway._current_reconnect_delay <= gateway._max_reconnect_delay
 
 
-async def test_webrtc_gateway_session_data_structures() -> None:
-    """Test WebRTCSession data structure."""
-    config = RTCConfiguration()
-    pc = RTCPeerConnection(configuration=config)
-
-    session = WebRTCSession(session_id="test-123", peer_connection=pc)
-
-    assert session.session_id == "test-123"
-    assert session.peer_connection is pc
-    assert session.data_channel is None
-    assert session.local_ws is None
-    assert session.message_queue is not None
-    assert session.forward_to_local_task is None
-    assert session.forward_from_local_task is None
-
-    # Cleanup
-    await pc.close()
-
-
-async def test_webrtc_gateway_handle_offer_without_session(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_handle_offer_without_session(cert_pems: tuple[str, str]) -> None:
     """Test WebRTCGateway handles offer for non-existent session gracefully."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
     # Try to handle offer for non-existent session
@@ -766,13 +638,17 @@ async def test_webrtc_gateway_handle_offer_without_session(mock_certificate: Moc
     # Should not crash
 
 
-async def test_webrtc_gateway_handle_ice_candidate_without_session(mock_certificate: Mock) -> None:
+async def test_webrtc_gateway_handle_ice_candidate_without_session(
+    cert_pems: tuple[str, str],
+) -> None:
     """Test WebRTCGateway handles ICE candidate for non-existent session gracefully."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
     )
 
     # Try to handle ICE candidate for non-existent session
@@ -786,37 +662,6 @@ async def test_webrtc_gateway_handle_ice_candidate_without_session(mock_certific
     # Should not crash
 
 
-async def test_create_peer_connection_with_certificate() -> None:
-    """
-    Test that create_peer_connection_with_certificate correctly sets the custom certificate.
-
-    This verifies the fragile name-mangled private attribute access works correctly
-    and that our custom certificate fully replaces the auto-generated one, which is
-    critical for DTLS pinning.
-    """
-    # First verify the name-mangled attribute exists on RTCPeerConnection.
-    # If aiortc changes its internals, this will fail and alert us to update our code.
-    pc = RTCPeerConnection()
-    try:
-        assert hasattr(pc, "_RTCPeerConnection__certificates")
-    finally:
-        await pc.close()
-
-    # Now test our function correctly sets the certificate
-    private_key, cert = _generate_certificate()
-    certificate = RTCCertificate(key=private_key, cert=cert)
-    config = RTCConfiguration(iceServers=[RTCIceServer(urls="stun:stun.example.com:3478")])
-
-    pc = create_peer_connection_with_certificate(certificate, configuration=config)
-
-    try:
-        certificates = pc._RTCPeerConnection__certificates  # type: ignore[attr-defined]
-        assert len(certificates) == 1
-        assert certificates[0] is certificate
-    finally:
-        await pc.close()
-
-
 @pytest.mark.parametrize(
     "malicious_path",
     [
@@ -827,9 +672,10 @@ async def test_create_peer_connection_with_certificate() -> None:
     ],
 )
 async def test_http_proxy_request_cannot_change_host(
-    mock_certificate: Mock, malicious_path: str
+    cert_pems: tuple[str, str], malicious_path: str
 ) -> None:
     """An attacker-controlled proxy path must never change the target host (SSRF guard)."""
+    cert_pem, key_pem = cert_pems
     mock_session = Mock()
     captured_url: dict[str, str] = {}
 
@@ -849,10 +695,11 @@ async def test_http_proxy_request_cannot_change_host(
     gateway = WebRTCGateway(
         http_session=mock_session,
         remote_id="TEST-REMOTE-ID",
-        certificate=mock_certificate,
+        cert_pem=cert_pem,
+        key_pem=key_pem,
         local_ws_url="ws://localhost:8095/ws",
     )
-    session = WebRTCSession(session_id="s1", peer_connection=Mock())
+    session = WebRTCSession(session_id="s1", pc=Mock())
 
     await gateway._handle_http_proxy_request(
         session, {"id": "1", "method": "GET", "path": malicious_path}
@@ -863,3 +710,672 @@ async def test_http_proxy_request_cannot_change_host(
     assert parsed.port == 8095
     assert parsed.username is None
     assert "evil.com" not in (parsed.netloc or "")
+
+
+async def test_http_proxy_request_keeps_the_unverified_dial_on_this_host(
+    cert_pems: tuple[str, str],
+) -> None:
+    """The proxy must not carry its unverified TLS dial off this host."""
+    cert_pem, key_pem = cert_pems
+    mock_session = Mock()
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_request(_method: str, _url: str, **kwargs: object) -> AsyncMock:
+        captured_kwargs.update(kwargs)
+        response = AsyncMock()
+        response.status = 200
+        response.headers = {}
+        response.read = AsyncMock(return_value=b"")
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=response)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        return ctx
+
+    mock_session.request = fake_request
+
+    gateway = WebRTCGateway(
+        http_session=mock_session,
+        remote_id="TEST-REMOTE-ID",
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+        local_ws_url="wss://127.0.0.1:8095/ws",
+    )
+    session = WebRTCSession(session_id="s1", pc=Mock())
+
+    await gateway._handle_http_proxy_request(session, {"id": "1", "method": "GET", "path": "/info"})
+
+    assert captured_kwargs["ssl"] is False
+    assert captured_kwargs["allow_redirects"] is False
+
+
+async def test_local_websocket_dial_skips_certificate_verification(
+    cert_pems: tuple[str, str],
+) -> None:
+    """Reach the local API on the bind address, which no certificate is issued for."""
+    cert_pem, key_pem = cert_pems
+    mock_session = Mock()
+    captured_kwargs: dict[str, object] = {}
+
+    async def fake_ws_connect(_url: str, **kwargs: object) -> AsyncMock:
+        captured_kwargs.update(kwargs)
+        return AsyncMock()
+
+    mock_session.ws_connect = fake_ws_connect
+
+    gateway = WebRTCGateway(
+        http_session=mock_session,
+        remote_id="TEST-REMOTE-ID",
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+        local_ws_url="wss://127.0.0.1:8095/ws",
+    )
+    session = WebRTCSession(session_id="s1", pc=Mock())
+    channel = MagicMock()
+    channel.wait_open = AsyncMock()
+
+    with patch.object(gateway, "_schedule_close"):
+        await gateway._bridge_ma_api(session, channel)
+
+    assert captured_kwargs["ssl"] is False
+
+
+# ---- aiolibdatachannel loopback tests --------------------------------------
+#
+# These exercise the migrated gateway against real loopback PeerConnections
+# (offerer = browser role, answerer = gateway role) rather than mocking the
+# WebRTC layer. ICE servers are stubbed to [] so gathering completes on host
+# candidates only (fast, offline).
+
+
+@pytest.fixture(scope="session")
+def cert_pems() -> tuple[str, str]:
+    """Generate a throwaway DTLS cert/key as PEM strings for the gateway."""
+    private_key, cert = _generate_certificate()
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+    key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    return cert_pem, key_pem
+
+
+def _sha256_fingerprint(cert_pem: str) -> str:
+    """Compute the uppercase colon-separated SHA-256 fingerprint of a PEM certificate."""
+    body = "".join(line for line in cert_pem.splitlines() if line and not line.startswith("-----"))
+    der = base64.b64decode(body)
+    digest = hashlib.sha256(der).hexdigest().upper()
+    return ":".join(digest[i : i + 2] for i in range(0, len(digest), 2))
+
+
+class _FakeSignaling:
+    """Signaling WebSocket stand-in that captures outbound JSON messages."""
+
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+
+    async def send_json(self, data: dict[str, Any]) -> None:
+        self.messages.append(data)
+
+    @property
+    def answers(self) -> list[dict[str, Any]]:
+        return [m for m in self.messages if m.get("type") == "answer"]
+
+
+class _FakeLocalWS:
+    """Minimal aiohttp WebSocket stand-in for channel-bridging tests."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.sent: list[str | bytes] = []
+        self._incoming: asyncio.Queue[SimpleNamespace | None] = asyncio.Queue()
+
+    async def send_str(self, data: str) -> None:
+        self.sent.append(data)
+
+    async def send_bytes(self, data: bytes) -> None:
+        self.sent.append(data)
+
+    async def close(self) -> None:
+        self.closed = True
+        self._incoming.put_nowait(None)
+
+    def feed_text(self, data: str) -> None:
+        """Queue a text message as if the local server sent it."""
+        self._incoming.put_nowait(SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=data))
+
+    def feed_bytes(self, data: bytes) -> None:
+        """Queue a binary message as if the local server sent it."""
+        self._incoming.put_nowait(SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=data))
+
+    def __aiter__(self) -> AsyncIterator[SimpleNamespace]:
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        msg = await self._incoming.get()
+        if msg is None:
+            raise StopAsyncIteration
+        return msg
+
+
+class _FakeBidiChannel:
+    """
+    Async-iterable data-channel stand-in for bridging tests.
+
+    Drives the gateway's channel->local pump without a real WebRTC handshake: feed
+    inbound messages with :meth:`feed`, end the stream with :meth:`close`, and read
+    what the gateway sent back on ``sent``.
+    """
+
+    def __init__(self, label: str = "ma-api") -> None:
+        self.label = label
+        self.is_open = True
+        self.closed = False
+        self.sent: list[str | bytes] = []
+        self._inbound: asyncio.Queue[str | bytes | None] = asyncio.Queue()
+
+    async def wait_open(self) -> None:
+        return
+
+    async def send(self, data: str | bytes) -> None:
+        self.sent.append(data)
+
+    def feed(self, message: str | bytes) -> None:
+        """Queue an inbound message as if the browser sent it over the channel."""
+        self._inbound.put_nowait(message)
+
+    def close(self) -> None:
+        self.closed = True
+        self.is_open = False
+        self._inbound.put_nowait(None)
+
+    async def aclose(self) -> None:
+        self.close()
+
+    def __aiter__(self) -> AsyncIterator[str | bytes]:
+        return self
+
+    async def __anext__(self) -> str | bytes:
+        message = await self._inbound.get()
+        if message is None:
+            raise StopAsyncIteration
+        return message
+
+
+class _FakeHttpSession:
+    """ClientSession stand-in handing out one fake WebSocket per dialed url."""
+
+    def __init__(self) -> None:
+        self.dialed: list[str] = []
+        self.dial_kwargs: list[dict[str, Any]] = []
+        self.websockets: dict[str, _FakeLocalWS] = {}
+
+    async def ws_connect(self, url: str, **kwargs: Any) -> _FakeLocalWS:
+        self.dialed.append(url)
+        self.dial_kwargs.append(kwargs)
+        local_ws = _FakeLocalWS()
+        self.websockets[url] = local_ws
+        return local_ws
+
+
+class _FakePeerConnection:
+    """PeerConnection stand-in that runs gateway-spawned pumps as asyncio tasks."""
+
+    def __init__(self) -> None:
+        self._tasks: list[asyncio.Task[None]] = []
+        self._incoming: asyncio.Queue[_FakeBidiChannel] = asyncio.Queue()
+
+    def spawn_task(self, coro: Coroutine[Any, Any, None]) -> None:
+        self._tasks.append(asyncio.ensure_future(coro))
+
+    def offer_channel(self, channel: _FakeBidiChannel) -> None:
+        """Offer a data channel as if the browser had opened it."""
+        self._incoming.put_nowait(channel)
+
+    async def incoming_data_channels(self) -> AsyncIterator[DataChannel]:
+        while True:
+            yield cast("DataChannel", await self._incoming.get())
+
+    async def aclose(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        # await cancellation so no pump task lingers past teardown
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+
+def _register_bridge_session(
+    gateway: WebRTCGateway, session_id: str, channel: _FakeBidiChannel
+) -> WebRTCSession:
+    """Register a session backed by a fake PeerConnection and ma-api channel."""
+    session = WebRTCSession(
+        session_id=session_id,
+        pc=cast("PeerConnection", _FakePeerConnection()),
+        data_channel=cast("DataChannel", channel),
+    )
+    gateway.sessions[session_id] = session
+    return session
+
+
+def _register_routed_session(
+    gateway: WebRTCGateway, session_id: str
+) -> tuple[WebRTCSession, _FakePeerConnection]:
+    """Register a session that routes the data channels offered to its PeerConnection."""
+    pc = _FakePeerConnection()
+    session = WebRTCSession(session_id=session_id, pc=cast("PeerConnection", pc))
+    gateway.sessions[session_id] = session
+    pc.spawn_task(gateway._accept_channels(session))
+    return session, pc
+
+
+async def _wait_for(predicate: Callable[[], bool], timeout: float = 15.0) -> None:
+    """Poll ``predicate`` until it is true or the timeout elapses."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("condition not met within timeout")
+
+
+async def test_handle_offer_answers_with_pinned_fingerprint(cert_pems: tuple[str, str]) -> None:
+    """The answer SDP carries the DTLS fingerprint of the configured certificate (pinning)."""
+    cert_pem, key_pem = cert_pems
+    gateway = WebRTCGateway(
+        http_session=Mock(),
+        remote_id="TEST-REMOTE-ID",
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+    )
+    signaling = _FakeSignaling()
+    gateway._signaling_ws = cast("aiohttp.ClientWebSocketResponse", signaling)
+    offerer = PeerConnection(RTCConfiguration())
+    session_id = "fingerprint-session"
+    try:
+        await offerer.create_data_channel("ma-api")
+        offer = await offerer.create_offer()
+        with patch.object(gateway, "_get_fresh_ice_servers", AsyncMock(return_value=[])):
+            await gateway._create_session(session_id)
+            await asyncio.wait_for(
+                gateway._handle_offer(session_id, {"sdp": offer.sdp, "type": "offer"}),
+                timeout=15,
+            )
+
+        assert len(signaling.answers) == 1
+        answer = signaling.answers[0]
+        assert answer["sessionId"] == session_id
+        assert answer["data"]["type"] == "answer"
+        fingerprint_line = next(
+            line for line in answer["data"]["sdp"].splitlines() if line.startswith("a=fingerprint:")
+        )
+        assert _sha256_fingerprint(cert_pem) in fingerprint_line
+    finally:
+        await gateway._close_session(session_id)
+        await offerer.aclose()
+
+
+async def test_ma_api_channel_bridges_to_local_ws(cert_pems: tuple[str, str]) -> None:
+    """Messages flow both ways across the ma-api data channel and the local WebSocket."""
+    cert_pem, key_pem = cert_pems
+    fake_ws = _FakeLocalWS()
+    http_session = Mock()
+    http_session.ws_connect = AsyncMock(
+        return_value=cast("aiohttp.ClientWebSocketResponse", fake_ws)
+    )
+    gateway = WebRTCGateway(
+        http_session=http_session,
+        remote_id="TEST-REMOTE-ID",
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+    )
+    channel = _FakeBidiChannel()
+    session = _register_bridge_session(gateway, "bridge-session", channel)
+    bridge = asyncio.ensure_future(gateway._bridge_ma_api(session, cast("DataChannel", channel)))
+    try:
+        await _wait_for(lambda: session.local_ws is not None)
+
+        # browser -> local WebSocket
+        channel.feed("from browser")
+        await _wait_for(lambda: fake_ws.sent == ["from browser"])
+
+        # local WebSocket -> browser
+        fake_ws.feed_text("from local")
+        await _wait_for(lambda: channel.sent == ["from local"])
+    finally:
+        channel.close()
+        await asyncio.wait_for(bridge, timeout=5)
+        await _wait_for(lambda: "bridge-session" not in gateway.sessions)
+
+
+def test_build_ice_servers_maps_dicts() -> None:
+    """ICE server dicts map to one IceServer per url, preserving TURN credentials."""
+    gateway = WebRTCGateway(
+        http_session=Mock(),
+        remote_id="TEST-REMOTE-ID",
+        cert_pem="cert",
+        key_pem="key",
+    )
+    servers: list[dict[str, Any]] = [
+        {"urls": "stun:stun.example.com:3478"},
+        {"urls": "turn:turn.example.com:3478", "username": "user", "credential": "pass"},
+        {
+            "urls": ["stun:a.example.com:3478", "turn:b.example.com:3478"],
+            "username": "u2",
+            "credential": "c2",
+        },
+    ]
+
+    result = gateway._build_ice_servers(servers)
+
+    assert all(isinstance(server, IceServer) for server in result)
+    # the two-url entry fans out, so 1 + 1 + 2 = 4 IceServers
+    assert len(result) == 4
+    assert result[0] == IceServer(url="stun:stun.example.com:3478")
+    assert result[1] == IceServer(
+        url="turn:turn.example.com:3478", username="user", credential="pass"
+    )
+    # to_url() inlines the TURN credentials for libdatachannel
+    assert result[1].to_url() == "turn:user:pass@turn.example.com:3478"
+    # list urls share the entry's credentials
+    assert result[2] == IceServer(url="stun:a.example.com:3478", username="u2", credential="c2")
+    assert result[3] == IceServer(url="turn:b.example.com:3478", username="u2", credential="c2")
+
+
+async def test_session_closes_when_ma_api_channel_closes(cert_pems: tuple[str, str]) -> None:
+    """Closing the browser ma-api channel tears down the whole gateway session."""
+    cert_pem, key_pem = cert_pems
+    fake_ws = _FakeLocalWS()
+    http_session = Mock()
+    http_session.ws_connect = AsyncMock(
+        return_value=cast("aiohttp.ClientWebSocketResponse", fake_ws)
+    )
+    gateway = WebRTCGateway(
+        http_session=http_session,
+        remote_id="TEST-REMOTE-ID",
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+    )
+    channel = _FakeBidiChannel()
+    session = _register_bridge_session(gateway, "channel-close-session", channel)
+    bridge = asyncio.ensure_future(gateway._bridge_ma_api(session, cast("DataChannel", channel)))
+    await _wait_for(lambda: session.local_ws is not None)
+
+    # the browser closes the ma-api channel -> the whole session is torn down
+    channel.close()
+
+    await _wait_for(lambda: "channel-close-session" not in gateway.sessions)
+    assert "channel-close-session" not in gateway.sessions
+    await asyncio.wait_for(bridge, timeout=5)
+
+
+# ---- channel routing -------------------------------------------------------
+
+LOCAL_WS_URL = "ws://127.0.0.1:8095/ws"
+SENDSPIN_URL = "ws://127.0.0.1:8927/sendspin"
+
+
+def _routing_gateway(
+    cert_pems: tuple[str, str],
+    http_session: _FakeHttpSession,
+    local_ws_url: str = LOCAL_WS_URL,
+    set_sendspin_player_callback: Callable[[str, str], None] | None = None,
+) -> WebRTCGateway:
+    """Create a gateway whose local WebSockets are all served by the fake HTTP session."""
+    cert_pem, key_pem = cert_pems
+    return WebRTCGateway(
+        http_session=cast("aiohttp.ClientSession", http_session),
+        remote_id="TEST-REMOTE-ID",
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+        local_ws_url=local_ws_url,
+        sendspin_url=SENDSPIN_URL,
+        set_sendspin_player_callback=set_sendspin_player_callback,
+    )
+
+
+async def test_sendspin_channel_bridges_to_the_sendspin_server(cert_pems: tuple[str, str]) -> None:
+    """A sendspin channel reaches the internal sendspin server, web player id and all."""
+    http_session = _FakeHttpSession()
+    announced_players: list[tuple[str, str]] = []
+    gateway = _routing_gateway(
+        cert_pems,
+        http_session,
+        set_sendspin_player_callback=lambda session_id, player_id: announced_players.append(
+            (session_id, player_id)
+        ),
+    )
+    session, pc = _register_routed_session(gateway, "sendspin-session")
+    channel = _FakeBidiChannel(label="sendspin")
+    pc.offer_channel(channel)
+    try:
+        await _wait_for(lambda: SENDSPIN_URL in http_session.websockets)
+        local_ws = http_session.websockets[SENDSPIN_URL]
+
+        # the first message announces the web player, and is forwarded verbatim
+        auth = json.dumps({"type": "auth", "token": "t", "client_id": "web-player-1"})
+        channel.feed(auth)
+        await _wait_for(lambda: local_ws.sent == [auth])
+        assert announced_players == [("sendspin-session", "web-player-1")]
+        assert session.sendspin_player_id == "web-player-1"
+
+        # audio keeps flowing in both directions, text and binary alike
+        channel.feed(b"\x01\x02")
+        await _wait_for(lambda: local_ws.sent == [auth, b"\x01\x02"])
+        local_ws.feed_text('{"type":"hello"}')
+        local_ws.feed_bytes(b"\x03\x04")
+        await _wait_for(lambda: channel.sent == ['{"type":"hello"}', b"\x03\x04"])
+    finally:
+        await gateway._close_session("sendspin-session")
+
+
+@pytest.mark.parametrize(
+    ("local_ws_url", "expected_url"),
+    [
+        ("ws://127.0.0.1:8095/ws", "ws://127.0.0.1:8095/live_announcement"),
+        # an https webserver is still dialed on its bind address, which no cert covers
+        ("wss://127.0.0.1:8095/ws", "wss://127.0.0.1:8095/live_announcement"),
+    ],
+)
+async def test_live_announcement_channel_bridges_to_the_webserver(
+    cert_pems: tuple[str, str], local_ws_url: str, expected_url: str
+) -> None:
+    """A live announcement channel reaches the webserver route that takes the audio."""
+    http_session = _FakeHttpSession()
+    gateway = _routing_gateway(cert_pems, http_session, local_ws_url=local_ws_url)
+    session, pc = _register_routed_session(gateway, "announce-session")
+    channel = _FakeBidiChannel(label="live_announcement")
+    pc.offer_channel(channel)
+    try:
+        await _wait_for(lambda: expected_url in http_session.websockets)
+        local_ws = http_session.websockets[expected_url]
+        assert http_session.dial_kwargs == [{"ssl": False}]
+
+        # the client authenticates on the route itself, so its handshake passes through
+        handshake = [
+            json.dumps({"type": "auth", "token": "t"}),
+            json.dumps({"type": "start", "player_id": "player1", "sample_rate": 16000}),
+        ]
+        for message in handshake:
+            channel.feed(message)
+        await _wait_for(lambda: local_ws.sent == handshake)
+        # the sendspin snoop belongs to the sendspin bridge only
+        assert session.sendspin_player_id is None
+
+        # spoken audio goes up, the route's replies come back
+        channel.feed(b"\x00\x01")
+        await _wait_for(lambda: local_ws.sent == [*handshake, b"\x00\x01"])
+        local_ws.feed_text('{"type":"started"}')
+        await _wait_for(lambda: channel.sent == ['{"type":"started"}'])
+    finally:
+        await gateway._close_session("announce-session")
+
+
+@pytest.mark.parametrize("closed_by", ["browser", "local"])
+async def test_closing_a_bridged_channel_leaves_the_api_session_up(
+    cert_pems: tuple[str, str], closed_by: str
+) -> None:
+    """Losing a bridged WebSocket tears down that bridge only, never the API session."""
+    http_session = _FakeHttpSession()
+    gateway = _routing_gateway(cert_pems, http_session)
+    session, pc = _register_routed_session(gateway, "mixed-session")
+    api_channel = _FakeBidiChannel()
+    sendspin_channel = _FakeBidiChannel(label="sendspin")
+    pc.offer_channel(api_channel)
+    pc.offer_channel(sendspin_channel)
+    try:
+        await _wait_for(
+            lambda: session.local_ws is not None and SENDSPIN_URL in http_session.dialed
+        )
+        sendspin_ws = http_session.websockets[SENDSPIN_URL]
+
+        if closed_by == "browser":
+            sendspin_channel.close()
+        else:
+            await sendspin_ws.close()
+        await _wait_for(lambda: not session.ws_bridges)
+
+        assert sendspin_ws.closed is True
+        assert sendspin_channel.closed is True
+        # the API session is untouched: still registered, still bridged, channel still open
+        assert "mixed-session" in gateway.sessions
+        assert session.local_ws is not None
+        assert cast("_FakeLocalWS", session.local_ws).closed is False
+        assert api_channel.closed is False
+    finally:
+        await gateway._close_session("mixed-session")
+
+
+async def test_the_first_channel_is_the_api_channel_whatever_its_label(
+    cert_pems: tuple[str, str],
+) -> None:
+    """Clients may label their API channel freely, so the first channel bridges to the API."""
+    http_session = _FakeHttpSession()
+    gateway = _routing_gateway(cert_pems, http_session)
+    session, pc = _register_routed_session(gateway, "labelled-session")
+    channel = _FakeBidiChannel(label="ma-api-v2")
+    pc.offer_channel(channel)
+    try:
+        await _wait_for(lambda: session.local_ws is not None)
+        assert session.data_channel is cast("DataChannel", channel)
+        assert http_session.dialed == [f"{LOCAL_WS_URL}?webrtc_session_id=labelled-session"]
+    finally:
+        await gateway._close_session("labelled-session")
+
+
+async def test_unknown_channel_label_cannot_replace_the_api_channel(
+    cert_pems: tuple[str, str],
+) -> None:
+    """A channel this server has no route for is refused instead of hijacking the session."""
+    http_session = _FakeHttpSession()
+    gateway = _routing_gateway(cert_pems, http_session)
+    session, pc = _register_routed_session(gateway, "unknown-session")
+    api_channel = _FakeBidiChannel()
+    unknown_channel = _FakeBidiChannel(label="channel-from-the-future")
+    pc.offer_channel(api_channel)
+    try:
+        await _wait_for(lambda: session.local_ws is not None)
+        pc.offer_channel(unknown_channel)
+        await _wait_for(lambda: unknown_channel.closed)
+
+        assert session.data_channel is cast("DataChannel", api_channel)
+        assert "unknown-session" in gateway.sessions
+        # only the API channel was ever bridged
+        assert http_session.dialed == [f"{LOCAL_WS_URL}?webrtc_session_id=unknown-session"]
+    finally:
+        await gateway._close_session("unknown-session")
+
+
+class _FakeDataChannel:
+    """Data channel stand-in that captures outbound messages for proxy tests."""
+
+    def __init__(self) -> None:
+        self.is_open = True
+        self.sent: list[str] = []
+
+    async def send(self, data: str) -> None:
+        self.sent.append(data)
+
+
+def _proxy_gateway(cert_pems: tuple[str, str]) -> WebRTCGateway:
+    cert_pem, key_pem = cert_pems
+    return WebRTCGateway(
+        http_session=Mock(),
+        remote_id="TEST-REMOTE-ID",
+        cert_pem=cert_pem,
+        key_pem=key_pem,
+    )
+
+
+def _reassemble_chunks(frames: list[str]) -> str:
+    """Reassemble __chunk__ frames back into the original text (base64 -> bytes -> utf-8)."""
+    parsed = [json.loads(f) for f in frames]
+    assert all(f["type"] == "__chunk__" for f in parsed)
+    assert len({f["id"] for f in parsed}) == 1
+    count = parsed[0]["count"]
+    parts: list[bytes] = [b""] * count
+    for frame in parsed:
+        parts[frame["seq"]] = base64.b64decode(frame["b64"])
+    return b"".join(parts).decode()
+
+
+async def test_http_proxy_response_small_body_single_message(
+    cert_pems: tuple[str, str],
+) -> None:
+    """A body within the chunk size is sent as one legacy http-proxy-response message."""
+    gateway = _proxy_gateway(cert_pems)
+    channel = _FakeDataChannel()
+    session = cast("WebRTCSession", SimpleNamespace(data_channel=channel))
+    body = b"\x00\x01\x02small-body"
+
+    await gateway._send_http_proxy_response(session, "req-small", 200, {"X-Test": "y"}, body)
+
+    assert len(channel.sent) == 1
+    msg = json.loads(channel.sent[0])
+    assert msg["type"] == "http-proxy-response"
+    assert msg["id"] == "req-small"
+    assert msg["status"] == 200
+    assert msg["headers"] == {"X-Test": "y"}
+    assert bytes.fromhex(msg["body"]) == body
+
+
+async def test_http_proxy_response_large_body_chunked(cert_pems: tuple[str, str]) -> None:
+    """A large HTTP-proxy response is split into base64 chunk frames the client reassembles."""
+    gateway = _proxy_gateway(cert_pems)
+    channel = _FakeDataChannel()
+    session = cast("WebRTCSession", SimpleNamespace(data_channel=channel))
+    body = bytes(range(256)) * ((MA_API_CHUNK_SIZE * 5) // 512)  # big body -> big JSON message
+
+    await gateway._send_http_proxy_response(session, "req-big", 200, {}, body)
+
+    assert len(channel.sent) > 1
+    assert all(json.loads(m)["type"] == "__chunk__" for m in channel.sent)
+    # every serialized frame must stay under the negotiated 256 KiB data-channel limit
+    assert all(len(m.encode()) < 256 * 1024 for m in channel.sent)
+
+    reassembled = json.loads(_reassemble_chunks(channel.sent))
+    assert reassembled["type"] == "http-proxy-response"
+    assert reassembled["id"] == "req-big"
+    assert reassembled["status"] == 200
+    assert bytes.fromhex(reassembled["body"]) == body
+
+
+async def test_send_ma_api_small_message_passthrough(cert_pems: tuple[str, str]) -> None:
+    """A ma-api message within the limit is sent verbatim, not chunked."""
+    gateway = _proxy_gateway(cert_pems)
+    channel = _FakeDataChannel()
+    await gateway._send_ma_api(cast("DataChannel", channel), '{"event":"player_updated"}')
+    assert channel.sent == ['{"event":"player_updated"}']
+
+
+async def test_send_ma_api_large_message_chunked(cert_pems: tuple[str, str]) -> None:
+    """A large ma-api message is chunked and reassembles byte-identically (multibyte-safe)."""
+    gateway = _proxy_gateway(cert_pems)
+    channel = _FakeDataChannel()
+    # multibyte payload so chunk boundaries fall mid-character, exercising the byte-level split
+    text = '{"data":"' + "音楽" * MA_API_CHUNK_SIZE + '"}'
+
+    await gateway._send_ma_api(cast("DataChannel", channel), text)
+
+    assert len(channel.sent) > 1
+    assert all(len(m.encode()) < 256 * 1024 for m in channel.sent)
+    assert _reassemble_chunks(channel.sent) == text

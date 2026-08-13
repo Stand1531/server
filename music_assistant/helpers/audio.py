@@ -255,6 +255,32 @@ def create_wave_header(
     return file.getvalue()
 
 
+def create_streaming_wave_header(audio_format: AudioFormat) -> bytes:
+    """
+    Generate a wave header for a stream whose length is not known up front.
+
+    :param audio_format: The PCM format the audio behind the header is in.
+    """
+    channels = audio_format.channels
+    sample_rate = audio_format.sample_rate
+    bits_per_sample = audio_format.bit_depth
+    byte_rate = sample_rate * channels * (bits_per_sample // 8)
+    block_align = channels * (bits_per_sample // 8)
+    # RIFF size & data size both set to 0xFFFFFFFF so clients honoring the WAV
+    # length fields don't cut the stream off (create_wave_header hardcodes ~6.7h).
+    return (
+        b"RIFF"
+        + struct.pack("<L", 0xFFFFFFFF)
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack(
+            "<LHHLLHH", 16, 1, channels, sample_rate, byte_rate, block_align, bits_per_sample
+        )
+        + b"data"
+        + struct.pack("<L", 0xFFFFFFFF)
+    )
+
+
 def parse_extinf_metadata(extinf_line: str) -> dict[str, str]:
     """
     Parse metadata from HLS EXTINF line.
@@ -662,6 +688,52 @@ async def store_content_length_in_cache(
     )
 
 
+PROBED_DURATION_CACHE_CATEGORY = 51
+PROBED_DURATION_CACHE_PROVIDER = "audio"
+PROBED_DURATION_CACHE_EXPIRATION = 365 * 86400  # 1 year
+
+
+async def get_probed_duration(mass: MusicAssistant, uri: str) -> int | None:
+    """
+    Get the duration determined during an earlier playback of the given item, if any.
+
+    Use for items whose provider does not report a duration, such as podcast episodes
+    from a feed without itunes:duration.
+
+    :param mass: The MusicAssistant instance (for cache access).
+    :param uri: The media item URI (e.g. "overcast--1://podcast_episode/abc").
+    :return: The duration in seconds, or None if the item was never played.
+    """
+    duration: int | None = await mass.cache.get(
+        uri,
+        provider=PROBED_DURATION_CACHE_PROVIDER,
+        category=PROBED_DURATION_CACHE_CATEGORY,
+    )
+    return duration
+
+
+async def store_probed_duration(mass: MusicAssistant, uri: str, duration: int) -> None:
+    """
+    Store the duration of an item that was determined while streaming it.
+
+    A duration below a second is ignored.
+
+    :param mass: The MusicAssistant instance (for cache access).
+    :param uri: The media item URI (e.g. "overcast--1://podcast_episode/abc").
+    :param duration: The duration in seconds.
+    """
+    if duration < 1:
+        return
+    await mass.cache.set(
+        uri,
+        duration,
+        expiration=PROBED_DURATION_CACHE_EXPIRATION,
+        provider=PROBED_DURATION_CACHE_PROVIDER,
+        category=PROBED_DURATION_CACHE_CATEGORY,
+        persistent=True,
+    )
+
+
 def get_bit_rate(fmt: AudioFormat) -> int:
     """Get the (estimated) bit rate for a given AudioFormat, if known."""
     if fmt.bit_rate:
@@ -748,6 +820,9 @@ def get_normalization_mode(
         return VolumeNormalizationMode.DISABLED
     if streamdetails.media_type == MediaType.AUDIO_SOURCE:
         # live/realtime: upstream producer owns loudness, no measurement to converge on
+        return VolumeNormalizationMode.DISABLED
+    if streamdetails.media_type == MediaType.SOUND_EFFECT:
+        # never measured, and the dynamic fallback compresses short clips
         return VolumeNormalizationMode.DISABLED
     if streamdetails.target_loudness is None:
         # no target loudness set, disable normalization

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from music_assistant_models.media_items import AudioFormat
     from music_assistant_models.streamdetails import StreamDetails
 
+    from music_assistant.helpers.dsp import ComplexFilter
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.player import PlayerMedia
 
@@ -42,7 +43,7 @@ _QUALITY_RANK = {
 class AudioOutputPlan:
     """Executable filters and matching client-facing output details."""
 
-    filter_params: list[str]
+    filter_params: list[str | ComplexFilter]
     output_details: AudioOutputDetails
     input_format: AudioFormat
     handoff_format: AudioFormat | None = None
@@ -577,8 +578,6 @@ def _is_bit_perfect(
         return None
     if item.alters_audio:
         return False
-    if get_audio_quality(source_format) not in (AudioQuality.LOSSLESS, AudioQuality.HI_RES):
-        return False
     if get_audio_quality(output_format) not in (AudioQuality.LOSSLESS, AudioQuality.HI_RES):
         return False
     formats = [source_format]
@@ -613,9 +612,7 @@ def _is_bit_perfect(
     dsp_alters_audio = details.dsp.state == DSPState.ENABLED and (
         bool(details.dsp.filters) or details.dsp.input_gain != 0 or details.dsp.output_gain != 0
     )
-    return not (
-        dsp_alters_audio or details.dsp.output_limiter or details.source_channel is not None
-    )
+    return not (dsp_alters_audio or details.source_channel is not None)
 
 
 def _output_details_equal_ignoring_players(

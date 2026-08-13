@@ -12,23 +12,32 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
+from copy import deepcopy
 from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.enums import (
+    EventType,
     IdentifierType,
     PlaybackState,
     PlayerFeature,
     PlayerType,
     ProviderType,
 )
-from music_assistant_models.errors import PlayerCommandFailed
+from music_assistant_models.errors import PlayerCommandFailed, PlayerUnavailableError
 from music_assistant_models.player import OutputProtocol
 
 from music_assistant.constants import (
+    CONF_CACHED_ARP_MAC,
+    CONF_GROUP_MEMBERS,
     CONF_LINKED_PROTOCOL_IDS,
+    CONF_PLAYER_DSP,
+    CONF_PLAYER_QUEUES,
     CONF_PLAYERS,
     CONF_PREFERRED_OUTPUT_PROTOCOL,
+    CONF_PROTOCOL_KEY_SPLITTER,
     CONF_PROTOCOL_PARENT_ID,
+    CONF_REPORTED_MAC,
     CONF_UNDERLYING_PLAYER_ID,
     PROTOCOL_PRIORITY,
     VERBOSE_LOG_LEVEL,
@@ -39,13 +48,31 @@ from music_assistant.helpers.util import (
     normalize_mac_for_matching,
 )
 from music_assistant.models.player import Player
+from music_assistant.providers.sync_group.constants import CONF_ALLOWED_MEMBERS
 from music_assistant.providers.universal_player import UniversalPlayer, UniversalPlayerProvider
+from music_assistant.providers.universal_player.constants import (
+    CONF_DEVICE_IDENTIFIERS,
+    CONF_DEVICE_INFO,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
     from typing import Any
 
     from music_assistant import MusicAssistant
+
+# Config value keys that are bookkeeping of the universal player wrapper itself
+# (protocol links and device-identity caches) and must never be carried over
+# when a native player replaces a universal player.
+UNIVERSAL_PLAYER_INTERNAL_CONF_KEYS = (
+    CONF_LINKED_PROTOCOL_IDS,
+    CONF_PROTOCOL_PARENT_ID,
+    CONF_UNDERLYING_PLAYER_ID,
+    CONF_DEVICE_IDENTIFIERS,
+    CONF_DEVICE_INFO,
+    CONF_CACHED_ARP_MAC,
+    CONF_REPORTED_MAC,
+)
 
 
 class ProtocolLinkingMixin:
@@ -182,9 +209,9 @@ class ProtocolLinkingMixin:
             if protocol_player.protocol_parent_id:
                 protocol_player.refresh_state()
                 parent_player.refresh_state()
-                # Copy identifiers from protocol player to universal player on restore.
-                # Restored universal players start with empty identifiers which must be
-                # repopulated from their protocol players so that new protocol players
+                # Merge the protocol player's identifiers into the universal player
+                # so identifiers discovered since the last persist (e.g. an
+                # ARP-resolved MAC) are included and new protocol players
                 # (like Sendspin bridges) can match via identifiers.
                 if parent_player.provider.domain == "universal_player" and isinstance(
                     parent_player, UniversalPlayer
@@ -237,9 +264,8 @@ class ProtocolLinkingMixin:
                         # duplicate domain)
                         if not protocol_player.protocol_parent_id:
                             continue
-                        # Copy identifiers from protocol player to universal player
-                        # This is important for restored universal players which start
-                        # with empty identifiers
+                        # Merge the protocol player's identifiers into the universal
+                        # player so newly discovered identifiers are included as well
                         for conn_type, value in protocol_player.device_info.identifiers.items():
                             native_player.device_info.add_identifier(conn_type, value)
                         # Update model/manufacturer if universal player has generic values
@@ -571,11 +597,12 @@ class ProtocolLinkingMixin:
         """
         Update universal player's device info from protocol player if needed.
 
-        When a universal player is restored from config, it has generic device info
-        (model="Universal Player", manufacturer="Music Assistant"). This method
-        updates those values from a protocol player that has real device info.
+        A universal player carries generic placeholder device info
+        (model="Universal Player", manufacturer="Music Assistant") when no real
+        values are known for it (yet). This method updates those values from a
+        protocol player that has real device info.
         """
-        # Check if universal player has generic device info (from restore)
+        # Check if universal player has generic placeholder device info
         device_info = universal_player.device_info
         protocol_info = protocol_player.device_info
 
@@ -800,9 +827,16 @@ class ProtocolLinkingMixin:
                 keep.device_info.add_identifier(conn_type, value)
             keep.refresh_state()
 
-            # Persist updated data and remove the obsolete player
+            # Persist updated data before the obsolete player is removed
             self._save_universal_player_data(keep)
-            self.mass.create_task(self.unregister(remove.player_id, permanent=True))
+
+            # Carry over the user's configuration and re-point group memberships
+            # before the permanent removal below deletes the losing wrapper's config
+            self._migrate_universal_player_config(remove.player_id, keep.player_id)
+            self._repoint_group_memberships(remove.player_id, keep.player_id)
+
+            # Stop playback and remove the obsolete player
+            self.mass.create_task(self._stop_and_unregister(remove))
 
             # Only merge one at a time (re-evaluation will catch cascading merges)
             break
@@ -1002,8 +1036,176 @@ class ProtocolLinkingMixin:
             )
             native_player.refresh_state()
 
-            # Remove the now-obsolete universal player
-            self.mass.create_task(self.unregister(player.player_id, permanent=True))
+            # Carry over the user's configuration and re-point group memberships
+            # before the permanent removal below deletes the universal player's config
+            self._migrate_universal_player_config(player.player_id, native_player.player_id)
+            self._repoint_group_memberships(player.player_id, native_player.player_id)
+
+            # Stop playback and remove the now-obsolete universal player
+            self.mass.create_task(self._stop_and_unregister(player))
+
+    def _migrate_universal_player_config(self, universal_id: str, native_id: str) -> None:
+        """
+        Carry over user-set configuration from a replaced universal player.
+
+        Copies the custom display name, player config values, DSP settings and
+        per-queue settings of the (obsolete) universal player onto the native
+        player that replaces it, without overwriting values explicitly set on
+        the native player itself. Must be called while the universal player's
+        config still exists, as the permanent removal deletes it.
+
+        :param universal_id: Player id of the obsolete universal player being replaced.
+        :param native_id: Player id of the native player that replaces it.
+        """
+        source_raw = self.mass.config.get(f"{CONF_PLAYERS}/{universal_id}")
+        source_raw = source_raw if isinstance(source_raw, dict) else {}
+        target_key = f"{CONF_PLAYERS}/{native_id}"
+        target_raw = self.mass.config.get(target_key)
+        target_raw = target_raw if isinstance(target_raw, dict) else {}
+        player_config_changed = False
+
+        # only carry an actual user rename, not the auto-generated default name;
+        # likewise a name on the native player only counts as a user override when
+        # it differs from the default name (fresh configs store name == default_name)
+        custom_name = source_raw.get("name")
+        target_name = target_raw.get("name")
+        target_has_custom_name = bool(target_name) and target_name != target_raw.get("default_name")
+        if (
+            custom_name
+            and custom_name != source_raw.get("default_name")
+            and not target_has_custom_name
+        ):
+            self.mass.config.set(f"{target_key}/name", custom_name)
+            player_config_changed = True
+
+        source_values = source_raw.get("values")
+        source_values = source_values if isinstance(source_values, dict) else {}
+        target_values = target_raw.get("values")
+        target_values = target_values if isinstance(target_values, dict) else {}
+        for key, value in source_values.items():
+            if key in UNIVERSAL_PLAYER_INTERNAL_CONF_KEYS:
+                continue
+            if CONF_PROTOCOL_KEY_SPLITTER in key:
+                # stale virtual mirror of a protocol player's own config
+                continue
+            if key in target_values:
+                continue
+            self.mass.config.set(f"{target_key}/values/{key}", deepcopy(value))
+            player_config_changed = True
+
+        # DSP settings follow wholesale, unless the native player has its own
+        dsp_changed = False
+        source_dsp = self.mass.config.get(f"{CONF_PLAYER_DSP}/{universal_id}")
+        if source_dsp and not self.mass.config.get(f"{CONF_PLAYER_DSP}/{native_id}"):
+            self.mass.config.set(f"{CONF_PLAYER_DSP}/{native_id}", deepcopy(source_dsp))
+            dsp_changed = True
+
+        queue_changed = self._migrate_universal_queue_config(universal_id, native_id)
+
+        if not (player_config_changed or dsp_changed or queue_changed):
+            return
+        self.logger.info(
+            "Carried over configuration of universal player %s to %s", universal_id, native_id
+        )
+        if player_config_changed:
+            # the native player's in-place config was loaded before the carry-over,
+            # so reload it to make the migrated values (e.g. custom name) effective
+            self.mass.create_task(self._reapply_player_config(native_id))
+
+    def _migrate_universal_queue_config(self, universal_id: str, native_id: str) -> bool:
+        """
+        Move the per-queue settings of a replaced universal player to its replacement.
+
+        Queue ids equal player ids, so the source entry is removed once it is carried over.
+
+        :param universal_id: Player id of the obsolete universal player.
+        :param native_id: Player id of the native player that replaces it.
+        :return: True if any queue setting was carried over.
+        """
+        queue_changed = False
+        source_queue_raw = self.mass.config.get(f"{CONF_PLAYER_QUEUES}/{universal_id}")
+        source_queue_raw = source_queue_raw if isinstance(source_queue_raw, dict) else None
+        if source_queue_values := (source_queue_raw or {}).get("values"):
+            target_queue_key = f"{CONF_PLAYER_QUEUES}/{native_id}"
+            target_queue_raw = self.mass.config.get(target_queue_key)
+            target_queue_raw = (
+                deepcopy(target_queue_raw) if isinstance(target_queue_raw, dict) else {}
+            )
+            target_queue_values = target_queue_raw.setdefault("values", {})
+            for key, value in source_queue_values.items():
+                if key in target_queue_values:
+                    continue
+                target_queue_values[key] = deepcopy(value)
+                queue_changed = True
+            if queue_changed:
+                target_queue_raw["queue_id"] = native_id
+                self.mass.config.set(target_queue_key, target_queue_raw)
+        if source_queue_raw is not None:
+            self.mass.config.remove(f"{CONF_PLAYER_QUEUES}/{universal_id}")
+        return queue_changed
+
+    async def _reapply_player_config(self, player_id: str) -> None:
+        """Reload the stored config onto a registered player and refresh its state."""
+        if not (player := self.get_player(player_id)):
+            return
+        config = await self.mass.config.get_player_config(player_id)
+        player.set_config(config)
+        player.update_state()
+        self.mass.signal_event(EventType.PLAYER_CONFIG_UPDATED, object_id=player_id, data=config)
+
+    def _repoint_group_memberships(self, old_player_id: str, new_player_id: str) -> None:
+        """
+        Re-point group memberships from a removed player to its successor.
+
+        When a universal player is replaced by a native player or merged into
+        another universal player, other players that list the removed player as
+        a group member (or allowed member) must follow its successor so those
+        memberships are not silently lost. Updates the persisted config and keeps
+        any registered player whose membership changed in sync.
+
+        :param old_player_id: Player id that is being removed.
+        :param new_player_id: Player id that replaces it.
+        """
+        all_player_configs = self.mass.config.get(CONF_PLAYERS, {})
+        if not isinstance(all_player_configs, dict):
+            return
+        for other_id, other_cfg in all_player_configs.items():
+            if not isinstance(other_cfg, dict):
+                continue
+            other_values = other_cfg.get("values")
+            if not isinstance(other_values, dict):
+                continue
+            for key in (CONF_GROUP_MEMBERS, CONF_ALLOWED_MEMBERS):
+                members = other_values.get(key)
+                if not isinstance(members, list) or old_player_id not in members:
+                    continue
+                new_members: list[str] = []
+                for member_id in members:
+                    resolved = new_player_id if member_id == old_player_id else member_id
+                    if resolved not in new_members:
+                        new_members.append(resolved)
+                self.mass.config.set(f"{CONF_PLAYERS}/{other_id}/values/{key}", new_members)
+                # keep a registered player's in-place config copy and state in sync
+                if other_player := self.get_player(other_id):
+                    if entry := other_player.config.values.get(key):
+                        entry.value = new_members
+                    other_player.refresh_state()
+
+    async def _stop_and_unregister(self, player: Player) -> None:
+        """
+        Stop active playback on a player and then permanently unregister it.
+
+        Used when an obsolete universal player is replaced or merged away: while
+        it is not idle its protocol child keeps playing the dead queue's stream
+        until the buffer drains, so playback is stopped first. Queue ownership is
+        intentionally not transferred.
+
+        :param player: The obsolete player to stop and permanently remove.
+        """
+        if player.playback_state != PlaybackState.IDLE:
+            with suppress(PlayerCommandFailed, PlayerUnavailableError):
+                await self.mass.player_queues.stop(player.player_id)
+        await self.unregister(player.player_id, permanent=True)
 
     def _parent_has_active_protocol_from_domain(
         self, parent: Player, domain: str, exclude_player_id: str | None = None
@@ -1340,21 +1542,19 @@ class ProtocolLinkingMixin:
             # since disabled/inactive protocols may only exist in the cached parent data.
             all_protocol_ids = set(self._get_known_protocol_ids(player))
             for protocol_id in all_protocol_ids:
-                # Clear cached parent ID in config so protocol won't try to
-                # restore a link to the deleted player on next restart
-                self._clear_protocol_parent_id(protocol_id)
                 if protocol_player := self.get_player(protocol_id):
                     # Protocol player is available: clear parent and schedule re-evaluation
                     # so it can be matched to a new parent or a new universal player
-                    protocol_player.set_protocol_parent_id(None)
-                    protocol_player.refresh_state()
                     self.logger.debug(
                         "Player %s removed - scheduling evaluation for protocol %s",
                         player.player_id,
                         protocol_id,
                     )
-                    self._schedule_protocol_evaluation(protocol_player)
+                    self._detach_protocol_child(protocol_player)
                 else:
+                    # Clear cached parent ID in config so protocol won't try to
+                    # restore a link to the deleted player on next restart
+                    self._clear_protocol_parent_id(protocol_id)
                     # Protocol player is not registered yet — it may still be
                     # mid-discovery (e.g., DLNA connecting via SSDP). Don't delete
                     # its config as that would cause a KeyError when it finishes
@@ -1365,6 +1565,40 @@ class ProtocolLinkingMixin:
                         player.player_id,
                         protocol_id,
                     )
+
+    def _detach_protocol_children(self, parent_id: str) -> None:
+        """
+        Detach the registered protocol players of a parent player that is going away.
+
+        Covers the removal paths that don't unregister the parent first (e.g. its
+        provider is unloaded), where the parent is not around anymore to enumerate
+        its protocol players.
+
+        :param parent_id: Player id of the parent that is being removed.
+        """
+        for protocol_player in list(self._players.values()):
+            if protocol_player.state.type != PlayerType.PROTOCOL:
+                continue
+            # a protocol player waiting for a parent that never registered only has
+            # the link in its config, so fall back to the cached parent
+            linked_parent_id = protocol_player.protocol_parent_id or (
+                self._get_cached_protocol_parent_id(protocol_player.player_id)
+            )
+            if linked_parent_id != parent_id:
+                continue
+            self.logger.debug(
+                "Player %s removed - scheduling evaluation for protocol %s",
+                parent_id,
+                protocol_player.player_id,
+            )
+            self._detach_protocol_child(protocol_player)
+
+    def _detach_protocol_child(self, protocol_player: Player) -> None:
+        """Clear a protocol player's parent link and schedule a fresh evaluation."""
+        self._clear_protocol_parent_id(protocol_player.player_id)
+        protocol_player.set_protocol_parent_id(None)
+        protocol_player.refresh_state()
+        self._schedule_protocol_evaluation(protocol_player)
 
     def _identifiers_match(
         self, player_a: Player, player_b: Player, protocol_domain: str = ""
@@ -1520,7 +1754,9 @@ class ProtocolLinkingMixin:
         # 1. Check if any output protocol is currently grouped
         for linked in player.linked_output_protocols:
             if protocol_player := self.get_player(linked.output_protocol_id):
-                if protocol_player.available and self._is_protocol_grouped(protocol_player):
+                if protocol_player.available_for_playback and self._is_protocol_grouped(
+                    protocol_player
+                ):
                     self.logger.log(
                         VERBOSE_LOG_LEVEL,
                         "Selected protocol for %s: %s (grouped)",
@@ -1529,9 +1765,12 @@ class ProtocolLinkingMixin:
                     )
                     return protocol_player, linked
 
-        # 2. Check for user's preferred output protocol
+        # 2. Check for user's preferred output protocol.
+        # The value is only stored while it differs from the entry's default, which is computed
+        # per player: "native" when a native output is available, otherwise "auto". Both of those
+        # are handled identically by the steps below, so an absent value can safely fall through.
         preferred = self.mass.config.get_raw_player_config_value(
-            player.player_id, CONF_PREFERRED_OUTPUT_PROTOCOL, "auto"
+            player.player_id, CONF_PREFERRED_OUTPUT_PROTOCOL
         )
         if preferred and preferred != "auto":
             if preferred == "native":
@@ -1546,7 +1785,7 @@ class ProtocolLinkingMixin:
                 for linked in player.linked_output_protocols:
                     if linked.output_protocol_id == preferred:
                         if protocol_player := self.get_player(linked.output_protocol_id):
-                            if protocol_player.available:
+                            if protocol_player.available_for_playback:
                                 self.logger.log(
                                     VERBOSE_LOG_LEVEL,
                                     "Selected protocol for %s: %s (user preference)",
@@ -1566,7 +1805,7 @@ class ProtocolLinkingMixin:
         # 4. Fall back to best protocol by priority
         for linked in sorted(player.linked_output_protocols, key=lambda x: x.priority):
             if protocol_player := self.get_player(linked.output_protocol_id):
-                if protocol_player.available:
+                if protocol_player.available_for_playback:
                     self.logger.log(
                         VERBOSE_LOG_LEVEL,
                         "Selected protocol for %s: %s (priority-based)",
@@ -1616,7 +1855,7 @@ class ProtocolLinkingMixin:
         for linked in player.linked_output_protocols:
             if (
                 (protocol_player := self.mass.players.get_player(linked.output_protocol_id))
-                and protocol_player.available
+                and protocol_player.available_for_playback
                 and required_feature in protocol_player.supported_features
             ):
                 return protocol_player
@@ -1745,16 +1984,16 @@ class ProtocolLinkingMixin:
         Returns tuple of (child_protocol_id, protocol_domain) or (None, None).
         """
         child_preferred = self.mass.config.get_raw_player_config_value(
-            child_player.player_id, CONF_PREFERRED_OUTPUT_PROTOCOL, "auto"
+            child_player.player_id, CONF_PREFERRED_OUTPUT_PROTOCOL
         )
         if not child_preferred or child_preferred in {"auto", "native"}:
             return None, None
 
-        # Find child's preferred protocol in linked protocols
+        # Find child's preferred protocol, with its current availability
         child_protocol = None
-        for linked in child_player.linked_output_protocols:
-            if linked.output_protocol_id == child_preferred:
-                child_protocol = linked
+        for output_protocol in child_player.output_protocols:
+            if output_protocol.output_protocol_id == child_preferred:
+                child_protocol = output_protocol
                 break
 
         if not child_protocol or not child_protocol.available:
@@ -1895,6 +2134,152 @@ class ProtocolLinkingMixin:
             child_player.state.name,
         )
         return True
+
+    def _translate_native_members_to_protocol(
+        self, parent_player: Player, protocol_domain: str, member_ids: list[str]
+    ) -> list[str]:
+        """
+        Translate natively grouped members onto the protocol domain the parent plays through.
+
+        Members that do not have that protocol cannot follow the parent at all and are
+        dropped with a warning instead.
+
+        :param parent_player: The parent player the members are grouped with.
+        :param protocol_domain: The protocol domain selected for the group.
+        :param member_ids: The member IDs that were selected for native grouping.
+        """
+        translated: list[str] = []
+        for member_id in member_ids:
+            member_player = self.get_player(member_id)
+            if not member_player:
+                continue
+            # a native group's members may be listed by their protocol player id
+            if member_player.protocol_parent_id:
+                member_player = self.get_player(member_player.protocol_parent_id) or member_player
+            member_protocol = member_player.get_output_protocol_by_domain(protocol_domain)
+            if not member_protocol or not member_protocol.available:
+                self.logger.warning(
+                    "Cannot group %s with %s: the group plays through the %s protocol, "
+                    "which %s does not support",
+                    member_player.state.name,
+                    parent_player.state.name,
+                    protocol_domain,
+                    member_player.state.name,
+                )
+                continue
+            # For native protocol players, use the member's player_id directly
+            translated.append(
+                member_player.player_id
+                if member_protocol.is_native
+                else member_protocol.output_protocol_id
+            )
+            self.logger.log(
+                VERBOSE_LOG_LEVEL,
+                "Moving %s from native grouping to the %s protocol",
+                member_player.state.name,
+                protocol_domain,
+            )
+        return translated
+
+    def _move_native_members_to_group_protocol(
+        self,
+        parent_player: Player,
+        parent_protocol_player: Player | None,
+        parent_protocol_domain: str | None,
+        protocol_members: list[str],
+        native_members: list[str],
+    ) -> None:
+        """
+        Move the members selected for native grouping onto the protocol the group ended up on.
+
+        Does nothing unless the group ends up on one of the parent's protocols while the
+        parent's native grouping needs the parent's own stream: only then do those members
+        have no session left to attach to.
+
+        :param parent_player: The parent player being joined.
+        :param parent_protocol_player: The protocol player selected for the group, if any.
+        :param parent_protocol_domain: The protocol domain selected for the group, if any.
+        :param protocol_members: The protocol member list the translated IDs are added to.
+        :param native_members: The native member IDs, emptied when they are moved over.
+        """
+        if not (
+            native_members
+            and parent_protocol_domain
+            and parent_protocol_player
+            and parent_protocol_player.player_id != parent_player.player_id
+            and parent_player.native_grouping_requires_own_stream
+        ):
+            return
+        protocol_members.extend(
+            self._translate_native_members_to_protocol(
+                parent_player, parent_protocol_domain, native_members
+            )
+        )
+        native_members.clear()
+
+    def _migrate_stranded_native_members(
+        self,
+        parent_player: Player,
+        parent_protocol_player: Player,
+        protocol_members: list[str],
+    ) -> list[str]:
+        """
+        Move the native members that a switch to the given protocol strands onto that protocol.
+
+        Returns the member IDs that are still attached to the parent's own stream, so the
+        caller can release them from it. Empty unless the parent renders that stream itself
+        while its native grouping attaches the members to exactly that stream: only then are
+        they left without anything to play.
+
+        :param parent_player: The parent player that is about to switch protocol.
+        :param parent_protocol_player: The protocol player the parent will render through.
+        :param protocol_members: The protocol member list the translated IDs are added to.
+        """
+        if parent_protocol_player.player_id == parent_player.player_id:
+            return []
+        if not parent_player.native_grouping_requires_own_stream:
+            return []
+        if parent_player.active_output_protocol not in (None, "native"):
+            return []
+        if parent_player.state.playback_state not in (PlaybackState.PLAYING, PlaybackState.PAUSED):
+            return []
+        stranded = [
+            member_id
+            for member_id in parent_player.group_members
+            if member_id != parent_player.player_id
+        ]
+        for protocol_id in self._translate_native_members_to_protocol(
+            parent_player, parent_protocol_player.provider.domain, stranded
+        ):
+            if protocol_id not in protocol_members:
+                protocol_members.append(protocol_id)
+        return stranded
+
+    async def _stop_native_session(
+        self,
+        parent_player: Player,
+        parent_protocol_player: Player,
+        stranded_native_members: list[str],
+    ) -> None:
+        """
+        Release the given members from the parent's own stream and stop it.
+
+        :param parent_player: The parent player whose native session is handed over.
+        :param parent_protocol_player: The protocol player taking the output over.
+        :param stranded_native_members: The members to release, already migrated.
+        """
+        self.logger.debug(
+            "Stopping the native session of %s before switching to %s, migrated members: %s",
+            parent_player.state.name,
+            parent_protocol_player.state.name,
+            stranded_native_members,
+        )
+        # The members already joined the protocol group, so the native session only has to
+        # release them and stop. Releasing them first also clears the native group, which
+        # keeps a later native playback command from resurrecting it. Both calls take the
+        # provider's own lock, so they must run one after the other.
+        await parent_player.set_members(player_ids_to_remove=stranded_native_members)
+        await parent_player.stop()
 
     def _translate_members_for_protocols(
         self,
@@ -2072,6 +2457,16 @@ class ProtocolLinkingMixin:
                 parent_player.state.name,
             )
 
+        # Post-pass: the protocol selected for the group is only known once every child has
+        # been processed, so the members picked for native grouping are corrected here.
+        self._move_native_members_to_group_protocol(
+            parent_player,
+            parent_protocol_player,
+            parent_protocol_domain,
+            protocol_members,
+            native_members,
+        )
+
         return protocol_members, native_members, parent_protocol_player, parent_protocol_domain
 
     async def _forward_protocol_set_members(
@@ -2114,6 +2509,17 @@ class ProtocolLinkingMixin:
             )
             return
 
+        # Members that ride the parent's own stream are stranded by the protocol switch below,
+        # so they join the protocol group in this very same call and their native session is
+        # torn down afterwards.
+        stranded_native_members = (
+            self._migrate_stranded_native_members(
+                parent_player, parent_protocol_player, filtered_protocol_add
+            )
+            if filtered_protocol_add
+            else []
+        )
+
         self.logger.debug(
             "Calling set_members on protocol player %s with add=%s, remove=%s",
             parent_protocol_player.state.name,
@@ -2144,6 +2550,12 @@ class ProtocolLinkingMixin:
         if filtered_protocol_add:
             previous_protocol = parent_player.active_output_protocol
             was_playing = parent_player.state.playback_state == PlaybackState.PLAYING
+            # A paused player still holds its output, so the handover has to run for it
+            # too - only the resume at the end is reserved for a player that was playing,
+            # so adding a member does not start playback on its own.
+            was_rendering = was_playing or parent_player.state.playback_state == (
+                PlaybackState.PAUSED
+            )
 
             # Determine if we're switching protocols (which requires restart)
             # Native protocol: parent_protocol_player is the same as parent_player
@@ -2158,27 +2570,32 @@ class ProtocolLinkingMixin:
 
             self.logger.debug(
                 "Protocol grouping: is_native=%s, already_native=%s, already_this=%s, "
-                "switching=%s, was_playing=%s",
+                "switching=%s, was_rendering=%s",
                 is_native_protocol,
                 already_using_native,
                 already_using_this_protocol,
                 switching_protocols,
-                was_playing,
+                was_rendering,
             )
 
             # Update active output protocol if not already using native
             if not (is_native_protocol and already_using_native):
                 parent_player.set_active_output_protocol(parent_protocol_player.player_id)
 
-            # Restart playback only if we're switching protocols
-            if was_playing and switching_protocols:
+            # Hand the output over only if we're switching protocols
+            if was_rendering and switching_protocols:
                 self.logger.info(
-                    "Restarting playback on %s via %s protocol after switching protocols",
+                    "Handing the output of %s over to the %s protocol%s",
                     parent_player.state.name,
                     parent_protocol_player.provider.domain,
+                    " and resuming playback" if was_playing else "",
                 )
+                if stranded_native_members:
+                    await self._stop_native_session(
+                        parent_player, parent_protocol_player, stranded_native_members
+                    )
                 # Collect existing members from old protocol before stopping it,
-                # so we can re-add them to the new protocol after restart.
+                # so we can re-add them to the new protocol afterwards.
                 old_protocol_members: list[str] = []
                 if (
                     previous_protocol
@@ -2212,7 +2629,8 @@ class ProtocolLinkingMixin:
                 else:
                     old_parent_members = []
                 # Resume playback on the new protocol and re-add migrated members.
-                await self.mass.players.cmd_resume(parent_player.player_id)
+                if was_playing:
+                    await self.mass.players.cmd_resume(parent_player.player_id)
                 if old_parent_members:
                     self.logger.debug(
                         "Re-adding migrated members %s to %s on new protocol",

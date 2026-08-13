@@ -42,16 +42,20 @@ from music_assistant.helpers.images import (
     is_svg_data,
     player_image_url,
 )
-from music_assistant.mass import MusicAssistant
 
 
 @pytest.fixture
-async def metadata_controller(mass_minimal: MusicAssistant) -> MetaDataController:
-    """Construct a MetaDataController with the minimal MA fixture."""
-    await mass_minimal.cache._setup_database()
-    controller = MetaDataController(mass_minimal)
-    mass_minimal.metadata = controller
-    return controller
+async def metadata_controller(
+    cache_database: None,  # noqa: ARG001
+    metadata_controller: MetaDataController,
+) -> MetaDataController:
+    """
+    Construct a MetaDataController backed by the cache database.
+
+    The controller tests in this module all persist and resolve image ids, unlike the
+    pure helper tests here, which need neither a controller nor a cache database.
+    """
+    return metadata_controller
 
 
 async def _wait_for_persisted_image_id(
@@ -450,6 +454,19 @@ async def test_handle_imageproxy_rejects_extra_path_segments(
     # double slash after the prefix must not be accepted either
     bad = await metadata_controller.handle_imageproxy(_fake_request(f"/imageproxy//{image_id}"))
     assert bad.status == 400
+
+
+async def test_handle_imageproxy_rejects_unsupported_size(
+    metadata_controller: MetaDataController,
+) -> None:
+    """A size outside the allowed set is rejected with a non-empty reason body."""
+    image_id = metadata_controller.compute_image_id("filesystem", "/local/cover.jpg")
+    request = MagicMock()
+    request.path = f"/imageproxy/{image_id}"
+    request.query = {"size": "300"}
+    bad = await metadata_controller.handle_imageproxy(request)
+    assert bad.status == 400
+    assert bad.text
 
 
 def test_is_svg_data() -> None:
