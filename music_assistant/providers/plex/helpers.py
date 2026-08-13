@@ -150,6 +150,7 @@ async def get_section_info(
     local_server_port: str,
     local_server_verify_cert: bool,
     instance_id: str | None = None,
+    plex_server: PlexServer | None = None,
 ) -> list[PlexSectionInfo]:
     """
     Get metadata for all music library sections on the Plex server.
@@ -167,26 +168,29 @@ async def get_section_info(
     cache_key = "plex_section_info"
     cache_provider = instance_id or local_server_ip
 
+    if plex_server is None:
+        raise ValueError("plex_server must be provided")
+
     def _get_section_info() -> list[PlexSectionInfo]:
-        session = requests.Session()
-        session.verify = local_server_verify_cert
-        local_server_protocol = "https" if local_server_ssl else "http"
-        plex_server: PlexServer
-        plex_url = f"{local_server_protocol}://{local_server_ip}:{local_server_port}"
-        try:
-            if not auth_token or auth_token == AUTH_TOKEN_UNAUTH:
-                # local (unauthenticated) connection, not via plex.tv
-                plex_server = PlexServer(plex_url, session=session)
-            else:
-                plex_server = PlexServer(plex_url, auth_token, session=session)
-        except requests.exceptions.ConnectionError as err:
-            LOGGER.warning(
-                "Could not connect to Plex server at %s:%s: %s",
-                local_server_ip,
-                local_server_port,
-                err,
-            )
-            return []
+        # session = requests.Session()
+        # session.verify = local_server_verify_cert
+        # local_server_protocol = "https" if local_server_ssl else "http"
+        # plex_server: PlexServer
+        # plex_url = f"{local_server_protocol}://{local_server_ip}:{local_server_port}"
+        # try:
+        #     if not auth_token or auth_token == AUTH_TOKEN_UNAUTH:
+        #         # local (unauthenticated) connection, not via plex.tv
+        #         plex_server = PlexServer(plex_url, session=session)
+        #     else:
+        #         plex_server = PlexServer(plex_url, auth_token, session=session)
+        # except requests.exceptions.ConnectionError as err:
+        #     LOGGER.warning(
+        #         "Could not connect to Plex server at %s:%s: %s",
+        #         local_server_ip,
+        #         local_server_port,
+        #         err,
+        #     )
+        #     return []
         results: list[PlexSectionInfo] = []
         for media_section in cast("list[PlexLibrarySection]", plex_server.library.sections()):
             if media_section.type != PlexMusicSection.TYPE:
