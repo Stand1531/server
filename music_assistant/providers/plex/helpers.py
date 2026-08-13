@@ -19,6 +19,7 @@ from plexapi.library import MusicSection as PlexMusicSection
 from plexapi.server import PlexServer
 
 from music_assistant.providers.plex.constants import AUTH_TOKEN_UNAUTH
+from plexapi.myplex import MyPlexAccount
 
 if TYPE_CHECKING:
     from plexapi.base import PlexObject
@@ -173,12 +174,59 @@ async def get_section_info(
         local_server_protocol = "https" if local_server_ssl else "http"
         plex_server: PlexServer
         plex_url = f"{local_server_protocol}://{local_server_ip}:{local_server_port}"
+        myplex_account = MyPlexAccount(token=auth_token)
         try:
-            if not auth_token or auth_token == AUTH_TOKEN_UNAUTH:
-                # local (unauthenticated) connection, not via plex.tv
+            # MyPlex authentication path
+            if auth_token and auth_token != AUTH_TOKEN_UNAUTH:
+
+                # Ensure we have a MyPlexAccount
+                if not myplex_account:
+                    try:
+                        myplex_account = MyPlexAccount(token=auth_token)
+                    except Exception as err:
+                        raise LoginFailed("Failed to authenticate with Plex.tv") from err
+
+                try:
+                    for resource in myplex_account.resources():
+
+                        if "server" not in resource.provides:
+                            continue
+
+                        # Match server by address/port
+                        for conn in resource.connections:
+                            if (
+                                conn.address == local_server_ip
+                                and int(conn.port) == int(local_server_port)
+                            ):
+
+                                logging.getLogger("music_assistant.providers.plex").info(
+                                    "Matched Plex resource '%s' (owned=%s)",
+                                    resource.name,
+                                    resource.owned,
+                                )
+                                # If owned use auth_token
+                                # If shared use resource.accessToken
+                                token = (
+                                    auth_token if resource.owned else resource.accessToken
+                                )
+
+                                plex_server = PlexServer(
+                                    f"{conn.protocol}://{conn.address}:{conn.port}",
+                                    token=token,
+                                    session=session,
+                                )
+                                break
+                        if plex_server:
+                            break
+
+                except plexapi.exceptions.Unauthorized as err:
+                    raise LoginFailed(f"Server {local_server_ip}:{local_server_port} not accessible in your Plex account") from err
+
+
+            # Local-only path
+            if auth_token == AUTH_TOKEN_UNAUTH:
+                # Local connection
                 plex_server = PlexServer(plex_url, session=session)
-            else:
-                plex_server = PlexServer(plex_url, auth_token, session=session)
         except requests.exceptions.ConnectionError as err:
             LOGGER.warning(
                 "Could not connect to Plex server at %s:%s: %s",

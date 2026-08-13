@@ -296,6 +296,8 @@ class PlexProvider(RecommendationPayloadMixin, MusicProvider):
                     "https" if self.get_setup_value(CONF_LOCAL_SERVER_SSL) else "http"
                 )
                 token = self.get_setup_value(CONF_AUTH_TOKEN)
+                myplex_account = self._myplex_account
+                local_server_port = self.get_setup_value(CONF_LOCAL_SERVER_PORT) or 32400
                 plex_url = (
                     f"{local_server_protocol}://{self.get_setup_value(CONF_LOCAL_SERVER_IP)}"
                     f":{self.get_setup_value(CONF_LOCAL_SERVER_PORT)}"
@@ -307,18 +309,75 @@ class PlexProvider(RecommendationPayloadMixin, MusicProvider):
                         "ignore",
                         category=urllib3.exceptions.InsecureRequestWarning,
                     )
+                    logging.getLogger("music_assistant.providers.plex").warning(
+                        "CONNECT: token exists=%s, token length=%s, auth_token_unauth=%s",
+                        bool(token),
+                        len(token) if token else 0,
+                        token == AUTH_TOKEN_UNAUTH,
+                    )
+                    # MyPlex authentication path
+                    if token and token != AUTH_TOKEN_UNAUTH:
+
+                        try:
+                            for resource in myplex_account.resources():
+
+                                logging.getLogger("music_assistant.providers.plex").warning(
+                                    "PLEX RESOURCE: name=%s owned=%s provides=%s",
+                                    resource.name,
+                                    resource.owned,
+                                    resource.provides,
+                                )
+                                if "server" not in resource.provides:
+                                    continue
+
+                                # Match server by address/port
+                                for conn in resource.connections:
+
+                                    logging.getLogger("music_assistant.providers.plex").warning(
+                                        "PLEX CONNECTION: resource=%s address=%s port=%s protocol=%s target=%s:%s",
+                                        resource.name,
+                                        conn.address,
+                                        conn.port,
+                                        conn.protocol,
+                                        self.get_setup_value(CONF_LOCAL_SERVER_IP),
+                                        local_server_port,
+                                    )
+                                    if (
+                                        conn.address == self.get_setup_value(CONF_LOCAL_SERVER_IP)
+                                        and int(conn.port) == local_server_port
+                                    ):
+
+                                        logging.getLogger("music_assistant.providers.plex").info(
+                                            "Matched Plex resource '%s' (owned=%s)",
+                                            resource.name,
+                                            resource.owned,
+                                        )
+                                        # If owned use token
+                                        # If shared use resource.accessToken
+                                        token = (
+                                            token if resource.owned else resource.accessToken
+                                        )
+
+                                        plex_server = PlexServer(
+                                            f"{conn.protocol}://{conn.address}:{conn.port}",
+                                            token=token,
+                                            session=session,
+                                        )
+                                        break
+                                # Stop at correct server
+                                if plex_server:
+                                    break
+
+                        except plexapi.exceptions.Unauthorized as err:
+                            raise LoginFailed(f"Server {self.get_setup_value(CONF_LOCAL_SERVER_IP)}:{local_server_port} not accessible in your Plex account") from err
+
+
+                    # Local-only path
                     if token == AUTH_TOKEN_UNAUTH:
-                        # Doing local connection, not via plex.tv.
+                        # Local connection
                         plex_server = PlexServer(plex_url, session=session)
-                    else:
-                        plex_server = PlexServer(
-                            plex_url,
-                            token,
-                            session=session,
-                        )
                 # I don't think PlexAPI intends for this to be accessible, but we need it.
                 self._baseurl = plex_server._baseurl
-
             except plexapi.exceptions.BadRequest as err:
                 if "Invalid token" in str(err):
                     # the stored token is invalid; surface an auth failure so the user is
